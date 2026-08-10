@@ -882,7 +882,12 @@ def _format_resolved_response(request: Request, res, link):
         else:
             proxy_dlink = dlink_url
 
-        if f.get("stream_ready") and original_fs_id and surl:
+# চেক করবে ফাইলটি ভিডিও কি না
+        filename = f.get("filename", "")
+        is_video = bool(filename and filename.lower().endswith(VIDEO_EXTS))
+        
+        # ভিডিও হলে স্ট্রিমিং লিংক দিয়ে দিবে (রেডি না হলেও)
+        if (f.get("stream_ready") or is_video) and original_fs_id and surl:
             signed = make_signed_params(request, surl, original_fs_id, "manifest", kind="manifest")
             proxy_stream = f"{_request_base_url(request)}/api/stream/manifest?surl={surl}&fs_id={original_fs_id}&{signed}"
         else:
