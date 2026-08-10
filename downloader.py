@@ -448,7 +448,7 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
         "stream_ready": False,
         "stream_m3u8": None,
         "error": None,
-        "thumbnails": item.get("thumbs"),
+        "thumbnails": none,
         "path": item.get("path"),
         "is_directory": str(item.get("isdir")) == "1"
     }
