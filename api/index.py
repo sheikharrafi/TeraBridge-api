@@ -37,8 +37,20 @@ from api.account_pool import get_next_healthy_account, mark_account_unhealthy, A
 
 app = FastAPI(title="TeraBridge API", version="2.0.0")
 
-# Gzip Compression Middleware
-app.add_middleware(GZipMiddleware, minimum_size=500)
+# Gzip Compression Middleware — only useful for JSON/text responses.
+# Video, thumbnail, and segment bytes are already compressed; running them
+# through gzip again burns CPU on Railway's limited plan for zero benefit,
+# and adds latency to the exact streaming responses that need to be fast.
+_BINARY_STREAM_PREFIXES = ("/api/download", "/api/stream/segment", "/api/thumbnail", "/api/stream/thumbnail")
+
+class ConditionalGZipMiddleware(GZipMiddleware):
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and any(scope["path"].startswith(p) for p in _BINARY_STREAM_PREFIXES):
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+app.add_middleware(ConditionalGZipMiddleware, minimum_size=500)
 
 # Shared httpx client for proxy endpoints (download, segment, thumbnail).
 # Reusing a single client gives us persistent connection pooling, HTTP/2
