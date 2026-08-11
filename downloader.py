@@ -147,12 +147,7 @@ def _new_logid():
 
 
 async def refresh_account_tokens():
-    """Refresh account tokens from the authenticated main page.
-
-    The old CLI used baked-in tokens whenever they were non-empty.  TeraBox
-    binds these tokens to a browser session, so a valid ``ndus`` cookie is not
-    enough when those values are stale.
-    """
+    """Refresh account tokens from the authenticated main page."""
     global JSTOKEN, BDSTOKEN, LOGID
 
     browser_headers = {
@@ -179,12 +174,7 @@ async def refresh_account_tokens():
 
 
 async def resolve_share_session(surl, link):
-    """Get the share token required by ``/share/transfer``.
-
-    ``randsk`` must be supplied both as ``sekey`` and the ``TSID`` cookie.
-    Listing a share can work without it, while copying the share usually does
-    not, which is why the previous flow failed at transfer time.
-    """
+    """Get the share token required by ``/share/transfer``."""
     share_url = link if "://" in link else f"https://{link}"
     parsed = urllib.parse.urlparse(share_url)
     bases = [f"{parsed.scheme or 'https'}://{parsed.netloc}", BASE_PUBLIC, BASE_API]
@@ -315,14 +305,12 @@ def _create_session():
 
 _session = None
 
-
 def get_session():
     """Return the live shared client, recreating it after app shutdown/tests."""
     global _session
     if _session is None or _session.is_closed:
         _session = _create_session()
     return _session
-
 
 async def close_session():
     """Close the current client without leaving a permanently closed global."""
@@ -336,36 +324,11 @@ _VALID_SURL = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def parse_surl(url):
-    """
-    Extract and clean the shorturl key (`surl`) from a Terabox share link.
-
-    Recognized shapes:
-      - https://terabox.com/s/1ABCDEFG...        (path form)
-      - https://1024terabox.com/s/1ABCDEFG...
-      - https://terabox.com/share/list?surl=1ABCDEFG...   (query form)
-      - https://terabox.com/s/1ABCDEFG?fid=...
-      - 1ABCDEFG...                                (bare surl)
-
-    Cleaning rules:
-      1. The result must match [A-Za-z0-9_-]+. Anything else (including the
-         original URL when no marker is found) raises ValueError.
-      2. If the result is longer than 22 chars and starts with a leading run
-         of `1`s, strip up to _LEADING_ONE_MAX_STRIPS leading '1's. This matches
-         observed Terabox behavior where the URL-path form prepends a '1' to
-         a base62-ish identifier (so `/s/1ABC...` and `?surl=ABC...` resolve
-         to the same share). The strip is bounded so a malicious or malformed
-         input like '1111...1' cannot shrink to a single character.
-      3. After cleaning, the result must be at least _SURL_MIN_LEN chars.
-
-    Returns the cleaned surl string. Raises ValueError on invalid input.
-    """
+    """Extract and clean the shorturl key (`surl`) from a Terabox share link."""
     if not isinstance(url, str) or not url:
         raise ValueError("parse_surl: empty or non-string input")
 
     surl = None
-
-    # Query form: ?surl=...  (must check before path form so we don't get fooled
-    # by a URL that has both `?surl=` and `/s/` in it)
     if "surl=" in url:
         after = url.split("surl=", 1)[1]
         surl = after.split("&", 1)[0]
@@ -373,13 +336,6 @@ def parse_surl(url):
         after = url.split("/s/", 1)[1]
         surl = after.split("?", 1)[0].split("#", 1)[0]
     else:
-        # No `/s/` or `?surl=` marker found.
-        # Heuristic: a real Terabox share link is always an http(s) URL with a
-        # recognized marker. A bare identifier is one of:
-        #   - just letters/digits/underscore/hyphen (no slashes, no scheme, no dots)
-        #   - *not* starting with "http"
-        # Anything else (a URL without a marker, a path with multiple slashes,
-        # anything containing a dot in the path) is rejected.
         stripped = url.strip()
         if "://" in stripped or "/" in stripped or "." in stripped:
             raise ValueError(f"parse_surl: no surl marker found in {url!r}")
@@ -391,18 +347,11 @@ def parse_surl(url):
     if not surl:
         raise ValueError(f"parse_surl: no surl found in {url!r}")
 
-    # Drop any trailing path component that may have leaked in.
     surl = surl.rstrip("/").split("/")[-1]
 
     if not _VALID_SURL.match(surl):
         raise ValueError(f"parse_surl: extracted value {surl!r} contains invalid characters")
 
-    # Leading-'1' strip. Mirrors Terabox's convention of prepending a '1' to
-    # the path-form identifier (so /s/1ABC... and ?surl=ABC... resolve to the
-    # same share). Strip at most _LEADING_ONE_MAX_STRIPS leading '1' chars and
-    # only when the result is *still* at least _SURL_MIN_LEN chars long. The
-    # cap on iteration count prevents a pathological input like '1111...1'
-    # from collapsing to a single character.
     if len(surl) > 22 and surl.startswith("1"):
         for _ in range(_LEADING_ONE_MAX_STRIPS):
             if not surl.startswith("1") or len(surl) - 1 < _SURL_MIN_LEN or len(surl) <= 22:
@@ -410,9 +359,7 @@ def parse_surl(url):
             surl = surl[1:]
 
     if len(surl) < _SURL_MIN_LEN:
-        raise ValueError(
-            f"parse_surl: cleaned surl {surl!r} is shorter than the {_SURL_MIN_LEN}-char minimum"
-        )
+        raise ValueError(f"parse_surl: cleaned surl {surl!r} is shorter than the {_SURL_MIN_LEN}-char minimum")
 
     return surl
 
@@ -448,7 +395,7 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
         "stream_ready": False,
         "stream_m3u8": None,
         "error": None,
-        "thumbnails": none,
+        "thumbnails": None,
         "path": item.get("path"),
         "is_directory": str(item.get("isdir")) == "1"
     }
@@ -689,26 +636,8 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
     uk = share_data.get("uk")
     files_list = share_data.get("list", [])
 
-    # Pre-fetch list of existing files in ROOT_PATH to prevent duplication
+    # OPTIMIZATION: Removed time-consuming pre-fetch of existing directory files
     existing_files = {}
-    if action != "l":
-        encoded_dir = urllib.parse.quote(ROOT_PATH)
-        try:
-            r_list = await get_session().get(
-                f"{BASE_API}/api/list?{qp()}&dir={encoded_dir}&order=time&desc=1&showempty=0&page=1&num=1000&bdstoken={BDSTOKEN}"
-            )
-            list_res = r_list.json()
-            if list_res.get("errno") == 0:
-                for entry in list_res.get("list", []):
-                    name = entry.get("server_filename")
-                    existing_files[name] = {
-                        "fs_id": str(entry.get("fs_id", "")),
-                        "path": entry.get("path", ""),
-                        "size": int(entry.get("size", 0)),
-                        "time": int(entry.get("server_mtime") or entry.get("ctime") or 0)
-                    }
-        except Exception as e:
-            print(f"[TeraBridge][WARN] Failed to list existing account files: {e}", flush=True)
 
     # Transfer requests mutate the same account/session. Serialising them
     # avoids triggering TeraBox verification when a shared folder is large.
@@ -764,36 +693,7 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
                     elif action == "d":
                         r["error"] = "Failed to resolve direct download link (dlink) from batch filemetas."
 
-            # --- OPTIMIZE VIA LOCATEDOWNLOAD ---
-            # Resolve premium geographically-located CDN mirror links
-            async def upgrade_with_locate(r):
-                path = r.get("path")
-                if not path or r.get("is_directory") or r.get("error"):
-                    return
-                
-                encoded_path = urllib.parse.quote(path)
-                locate_url = (
-                    f"{BASE_API}/rest/2.0/pcs/file"
-                    f"?ant=1&app_id=250528&channel=0&check_blue=1&clienttype=17"
-                    f"&method=locatedownload&path={encoded_path}&vip=2"
-                )
-                try:
-                    # Request located mirrors with the same session cookies
-                    mr = await get_session().post(locate_url, content=" =", timeout=15.0)
-                    if mr.status_code == 200:
-                        urls = mr.json().get("urls", [])
-                        if urls:
-                            best_url = urls[0].get("url")
-                            if best_url:
-                                r["dlink"] = best_url
-                                # Keep reference to all mirrors for advanced tools if needed
-                                r["mirrors"] = [u.get("url") for u in urls]
-                except Exception:
-                    pass
-            
-            locate_tasks = [upgrade_with_locate(r) for r in results if r.get("path")]
-            if locate_tasks:
-                await asyncio.gather(*locate_tasks)
+            # OPTIMIZATION: Removed the extra API call for VIP locatedownload to save time. 
 
     return {
         "errno": 0,
