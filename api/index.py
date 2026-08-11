@@ -14,13 +14,17 @@ import re
 from collections import OrderedDict
 import logging
 
+# Add the project root directory to sys.path to resolve downloader module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 
 from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 
+# Load environment variables from .env file if present
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -33,8 +37,12 @@ from api.account_pool import get_next_healthy_account, mark_account_unhealthy, A
 
 app = FastAPI(title="TeraBridge API", version="2.0.0")
 
+# Gzip Compression Middleware
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
+# Shared httpx client for proxy endpoints (download, segment, thumbnail).
+# Reusing a single client gives us persistent connection pooling, HTTP/2
+# multiplexing, and eliminates per-request TCP/TLS handshake overhead.
 _proxy_client = httpx.AsyncClient(
     follow_redirects=True,
     timeout=120.0,
@@ -42,17 +50,19 @@ _proxy_client = httpx.AsyncClient(
     limits=httpx.Limits(max_connections=200, max_keepalive_connections=50, keepalive_expiry=90),
 )
 
-CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL", 60))         
-CACHE_MAX_ENTRIES = int(os.environ.get("CACHE_MAX_ENTRIES", 256)) 
-RATE_LIMIT_RPM    = int(os.environ.get("RATE_LIMIT_RPM", 30))    
-RATE_LIMIT_WINDOW = 60  
-API_KEY           = os.environ.get("API_KEY")                    
-HMAC_SECRET       = os.environ.get("HMAC_SECRET") or API_KEY        
+# ─── Configuration ───────────────────────────────────────────────────
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL", 60))         # Cache responses for 60s
+CACHE_MAX_ENTRIES = int(os.environ.get("CACHE_MAX_ENTRIES", 256)) # LRU eviction after 256 entries
+RATE_LIMIT_RPM    = int(os.environ.get("RATE_LIMIT_RPM", 30))    # 30 requests per minute per IP
+RATE_LIMIT_WINDOW = 60  # seconds
+API_KEY           = os.environ.get("API_KEY")                    # API Key for securing endpoints (REQUIRED in production)
+HMAC_SECRET       = os.environ.get("HMAC_SECRET") or API_KEY        # HMAC secret (falls back to API_KEY if not set; required if API_KEY is set)
 REQUIRE_API_KEY   = os.environ.get("REQUIRE_API_KEY", "auto").lower() not in ("0", "false", "no")
 TRUSTED_PROXY_CIDRS_RAW = os.environ.get("TRUSTED_PROXIES", "").strip()
 CRON_SECRET             = os.environ.get("CRON_SECRET")
 NOTIFICATION_WEBHOOK_URL = os.environ.get("NOTIFICATION_WEBHOOK_URL")
 
+# CORS Origin Allowlist
 ALLOWED_ORIGINS_RAW = os.environ.get("ALLOWED_ORIGINS", "").strip()
 ALLOWED_ORIGINS = frozenset(
     o.strip().rstrip("/") for o in ALLOWED_ORIGINS_RAW.split(",") if o.strip()
@@ -68,6 +78,7 @@ def _cors_origin_for_request(request: Request):
         return "*"
     return None
 
+# CORS Middleware
 allow_origins = list(ALLOWED_ORIGINS) if ALLOWED_ORIGINS else ["*"]
 app.add_middleware(
     CORSMiddleware,
@@ -78,12 +89,14 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
+# Dynamic Configuration Refresh Middleware variables
 _last_config_check = 0
 CONFIG_CHECK_INTERVAL = 60
 
 class ConfigRefreshMiddleware:
     def __init__(self, app):
         self.app = app
+
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["method"] != "OPTIONS":
             global _last_config_check
@@ -101,9 +114,12 @@ def _parse_trusted_cidrs(raw):
     cidrs = []
     for entry in raw.split(","):
         entry = entry.strip()
-        if not entry: continue
-        try: cidrs.append(ipaddress.ip_network(entry, strict=False))
-        except ValueError as e: print(f"[TeraBridge][WARN] Ignoring invalid TRUSTED_PROXIES entry {entry!r}: {e}")
+        if not entry:
+            continue
+        try:
+            cidrs.append(ipaddress.ip_network(entry, strict=False))
+        except ValueError as e:
+            print(f"[TeraBridge][WARN] Ignoring invalid TRUSTED_PROXIES entry {entry!r}: {e}")
     return cidrs
 
 TRUSTED_PROXY_CIDRS = _parse_trusted_cidrs(TRUSTED_PROXY_CIDRS_RAW)
@@ -118,21 +134,31 @@ _LOOPBACK_CIDRS = (
 
 def _peer_ip(request: Request):
     addr = request.client.host if request.client else None
-    if not addr: return None
-    try: return ipaddress.ip_address(addr.split("%")[0])
-    except ValueError: return None
+    if not addr:
+        return None
+    try:
+        return ipaddress.ip_address(addr.split("%")[0])
+    except ValueError:
+        return None
 
 def _is_trusted_peer(request: Request, peer=None):
-    if ON_VERCEL or ON_RENDER: return True
-    if peer is None: peer = _peer_ip(request)
-    if peer is None: return False
-    if any(peer in cidr for cidr in _LOOPBACK_CIDRS): return True
-    if TRUSTED_PROXY_CIDRS and any(peer in cidr for cidr in TRUSTED_PROXY_CIDRS): return True
+    if ON_VERCEL or ON_RENDER:
+        return True
+    if peer is None:
+        peer = _peer_ip(request)
+    if peer is None:
+        return False
+    if any(peer in cidr for cidr in _LOOPBACK_CIDRS):
+        return True
+    if TRUSTED_PROXY_CIDRS and any(peer in cidr for cidr in TRUSTED_PROXY_CIDRS):
+        return True
     return False
 
 def _client_ip(request: Request):
     cached = getattr(request.state, "_cached_client_ip", None)
-    if cached is not None: return cached
+    if cached is not None:
+        return cached
+
     resolved = _resolve_client_ip(request)
     request.state._cached_client_ip = resolved
     return resolved
@@ -140,15 +166,20 @@ def _client_ip(request: Request):
 def _resolve_client_ip(request: Request):
     if ON_VERCEL:
         v = request.headers.get("X-Vercel-Forwarded-For")
-        if v: return v.split(",")[0].strip()
+        if v:
+            return v.split(",")[0].strip()
         return request.client.host if request.client else "unknown"
 
     peer = _peer_ip(request)
-    if peer is None: return request.client.host if request.client else "unknown"
-    if not _is_trusted_peer(request, peer): return str(peer)
+    if peer is None:
+        return request.client.host if request.client else "unknown"
+
+    if not _is_trusted_peer(request, peer):
+        return str(peer)
 
     xff = request.headers.get("X-Forwarded-For", "")
-    if not xff: return str(peer)
+    if not xff:
+        return str(peer)
 
     if ON_RENDER or (not TRUSTED_PROXY_CIDRS and any(peer in c for c in _LOOPBACK_CIDRS)):
         return xff.split(",")[0].strip()
@@ -156,20 +187,26 @@ def _resolve_client_ip(request: Request):
     chain = [h.strip() for h in xff.split(",") if h.strip()]
     candidate = str(peer)
     for hop in reversed(chain):
-        try: hop_ip = ipaddress.ip_address(hop.split("%")[0])
-        except ValueError: return hop
-        if any(hop_ip in cidr for cidr in TRUSTED_PROXY_CIDRS): continue
+        try:
+            hop_ip = ipaddress.ip_address(hop.split("%")[0])
+        except ValueError:
+            return hop
+        if any(hop_ip in cidr for cidr in TRUSTED_PROXY_CIDRS):
+            continue
         return str(hop_ip)
     return candidate
 
 def _request_base_url(request: Request):
     scheme = request.url.scheme
-    if ON_RENDER or ON_VERCEL: scheme = "https"
+    if ON_RENDER or ON_VERCEL:
+        scheme = "https"
     elif _is_trusted_peer(request):
         forwarded_proto = request.headers.get("X-Forwarded-Proto")
-        if forwarded_proto: scheme = forwarded_proto.split(",")[0].strip()
+        if forwarded_proto:
+            scheme = forwarded_proto.split(",")[0].strip()
     return f"{scheme}://{request.url.netloc}"
 
+# ─── Thread-safe LRU Cache ──────────────────────────────────────────
 class ResponseCache:
     def __init__(self, max_entries=256, ttl_seconds=60, redis_client=None):
         self.redis_client = redis_client
@@ -180,10 +217,7 @@ class ResponseCache:
         self.misses = 0
 
     def _make_key(self, link, action, wait):
-        # [FIX 2] Prevent Domain Cache Mismatch by using SURL instead of full URL
-        try: surl = parse_surl(link)
-        except: surl = link
-        raw = f"{surl}|{action}|{wait}"
+        raw = f"{link}|{action}|{wait}"
         return hashlib.md5(raw.encode()).hexdigest()
 
     def get(self, link, action, wait):
@@ -194,15 +228,20 @@ class ResponseCache:
                 data_str = self.redis_client.get(redis_key)
                 if data_str:
                     self.hits += 1
-                    try: self.redis_client.incr("stats:cache_hits")
-                    except: pass
+                    try:
+                        self.redis_client.incr("stats:cache_hits")
+                    except Exception:
+                        pass
                     return json.loads(data_str)
                 else:
                     self.misses += 1
-                    try: self.redis_client.incr("stats:cache_misses")
-                    except: pass
+                    try:
+                        self.redis_client.incr("stats:cache_misses")
+                    except Exception:
+                        pass
                     return None
-            except Exception as e: print(f"[TeraBridge][WARN] Upstash Redis get error: {e}", flush=True)
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis get error: {e}", flush=True)
 
         if key in self._store:
             data, ts = self._store[key]
@@ -210,7 +249,8 @@ class ResponseCache:
                 self._store.move_to_end(key)
                 self.hits += 1
                 return data
-            else: del self._store[key]
+            else:
+                del self._store[key]
         self.misses += 1
         return None
 
@@ -221,11 +261,14 @@ class ResponseCache:
                 redis_key = f"cache:response:{key}"
                 self.redis_client.set(redis_key, json.dumps(response), ex=self._ttl)
                 return
-            except Exception as e: print(f"[TeraBridge][WARN] Upstash Redis put error: {e}", flush=True)
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis put error: {e}", flush=True)
 
-        if key in self._store: del self._store[key]
+        if key in self._store:
+            del self._store[key]
         self._store[key] = (response, time.time())
-        while len(self._store) > self._max: self._store.popitem(last=False)
+        while len(self._store) > self._max:
+            self._store.popitem(last=False)
 
     def stats(self):
         if self.redis_client:
@@ -233,15 +276,37 @@ class ResponseCache:
                 redis_hits = int(self.redis_client.get("stats:cache_hits") or 0)
                 redis_misses = int(self.redis_client.get("stats:cache_misses") or 0)
                 total = redis_hits + redis_misses
-                try: entries_count = len(self.redis_client.keys("cache:response:*") or [])
-                except Exception: entries_count = "unknown"
-                return { "provider": "upstash-redis", "entries": entries_count, "ttl_seconds": self._ttl, "hits": redis_hits, "misses": redis_misses, "hit_rate": f"{(redis_hits / total * 100):.1f}%" if total > 0 else "N/A" }
-            except Exception as e: print(f"[TeraBridge][WARN] Upstash Redis stats error: {e}", flush=True)
+                
+                try:
+                    entries_count = len(self.redis_client.keys("cache:response:*") or [])
+                except Exception:
+                    entries_count = "unknown"
+                
+                return {
+                    "provider": "upstash-redis",
+                    "entries": entries_count,
+                    "ttl_seconds": self._ttl,
+                    "hits": redis_hits,
+                    "misses": redis_misses,
+                    "hit_rate": f"{(redis_hits / total * 100):.1f}%" if total > 0 else "N/A",
+                }
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis stats error: {e}", flush=True)
+        
         total = self.hits + self.misses
-        return { "provider": "in-memory", "entries": len(self._store), "max_entries": self._max, "ttl_seconds": self._ttl, "hits": self.hits, "misses": self.misses, "hit_rate": f"{(self.hits / total * 100):.1f}%" if total > 0 else "N/A" }
+        return {
+            "provider": "in-memory",
+            "entries": len(self._store),
+            "max_entries": self._max,
+            "ttl_seconds": self._ttl,
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": f"{(self.hits / total * 100):.1f}%" if total > 0 else "N/A",
+        }
 
 cache = ResponseCache(max_entries=CACHE_MAX_ENTRIES, ttl_seconds=CACHE_TTL_SECONDS, redis_client=redis_client)
 
+# ─── Sliding-Window Rate Limiter ─────────────────────────────────────
 class RateLimiter:
     def __init__(self, max_requests=30, window_seconds=60, redis_client=None):
         self.redis_client = redis_client
@@ -261,19 +326,29 @@ class RateLimiter:
                 pipeline.zcard(key)
                 pipeline.expire(key, self._window)
                 res = pipeline.exec()
+                
                 count = int(res[2])
                 if count > self._max:
-                    try: self.redis_client.incr("stats:rate_limit_blocked")
-                    except: pass
+                    try:
+                        self.redis_client.incr("stats:rate_limit_blocked")
+                    except Exception:
+                        pass
                     return False
                 return True
-            except Exception as e: print(f"[TeraBridge][WARN] Upstash Redis rate limit check error: {e}", flush=True)
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis rate limit check error: {e}", flush=True)
 
-        if ip not in self._requests: self._requests[ip] = []
-        self._requests[ip] = [ts for ts in self._requests[ip] if now - ts < self._window]
+        if ip not in self._requests:
+            self._requests[ip] = []
+
+        self._requests[ip] = [
+            ts for ts in self._requests[ip] if now - ts < self._window
+        ]
+
         if len(self._requests[ip]) >= self._max:
             self.total_blocked += 1
             return False
+
         self._requests[ip].append(now)
         return True
 
@@ -288,9 +363,11 @@ class RateLimiter:
                 res = pipeline.exec()
                 count = int(res[1])
                 return max(0, self._max - count)
-            except Exception as e: print(f"[TeraBridge][WARN] Upstash Redis rate limit remaining error: {e}", flush=True)
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis rate limit remaining error: {e}", flush=True)
 
-        if ip not in self._requests: return self._max
+        if ip not in self._requests:
+            return self._max
         active = [ts for ts in self._requests[ip] if now - ts < self._window]
         return max(0, self._max - len(active))
 
@@ -298,20 +375,44 @@ class RateLimiter:
         if self.redis_client:
             try:
                 blocked = int(self.redis_client.get("stats:rate_limit_blocked") or 0)
-                try: active_clients = len(self.redis_client.keys("rate_limit:*") or [])
-                except Exception: active_clients = "unknown"
-                return { "provider": "upstash-redis", "max_rpm": self._max, "window_seconds": self._window, "active_clients": active_clients, "total_blocked": blocked }
-            except Exception as e: print(f"[TeraBridge][WARN] Upstash Redis rate limit stats error: {e}", flush=True)
+                try:
+                    active_keys = self.redis_client.keys("rate_limit:*") or []
+                    active_clients = len(active_keys)
+                except Exception:
+                    active_clients = "unknown"
+                return {
+                    "provider": "upstash-redis",
+                    "max_rpm": self._max,
+                    "window_seconds": self._window,
+                    "active_clients": active_clients,
+                    "total_blocked": blocked,
+                }
+            except Exception as e:
+                print(f"[TeraBridge][WARN] Upstash Redis rate limit stats error: {e}", flush=True)
 
         now = time.time()
-        active_ips = sum(1 for ts_list in self._requests.values() if any(now - ts < self._window for ts in ts_list))
-        return { "provider": "in-memory", "max_rpm": self._max, "window_seconds": self._window, "active_clients": active_ips, "total_blocked": self.total_blocked }
+        active_ips = sum(
+            1 for ts_list in self._requests.values()
+            if any(now - ts < self._window for ts in ts_list)
+        )
+        return {
+            "provider": "in-memory",
+            "max_rpm": self._max,
+            "window_seconds": self._window,
+            "active_clients": active_ips,
+            "total_blocked": self.total_blocked,
+        }
 
     def cleanup(self):
-        if self.redis_client: return
+        if self.redis_client:
+            return
         now = time.time()
-        stale = [ip for ip, ts_list in self._requests.items() if not any(now - ts < self._window for ts in ts_list)]
-        for ip in stale: del self._requests[ip]
+        stale = [
+            ip for ip, ts_list in self._requests.items()
+            if not any(now - ts < self._window for ts in ts_list)
+        ]
+        for ip in stale:
+            del self._requests[ip]
 
 rate_limiter = RateLimiter(max_requests=RATE_LIMIT_RPM, window_seconds=RATE_LIMIT_WINDOW, redis_client=redis_client)
 
@@ -324,17 +425,25 @@ from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup background cleanup task
     cleanup_task = asyncio.create_task(_periodic_cleanup())
     yield
+    # Shutdown logic: cancel cleanup task and close global clients
     cleanup_task.cancel()
-    try: await cleanup_task
-    except asyncio.CancelledError: pass
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    
+    # Close global HTTP clients cleanly to prevent resource leaks/warnings
     await _proxy_client.aclose()
     await close_session()
-    if redis_client: redis_client.close()
+    if redis_client:
+        redis_client.close()
 
 app.router.lifespan_context = lifespan
 
+# ─── Firebase ID Token Validation Helpers ────────────────────────────
 FIREBASE_PROJECT_ID = os.environ.get("VITE_FIREBASE_PROJECT_ID") or os.environ.get("FIREBASE_PROJECT_ID") or "teraplay-project"
 GOOGLE_KEYS_URL = "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com"
 _google_public_keys = {}
@@ -354,14 +463,17 @@ async def get_google_public_keys():
                     cache_control = r.headers.get("Cache-Control", "")
                     max_age = 3600
                     match = re.search(r'max-age=(\d+)', cache_control)
-                    if match: max_age = int(match.group(1))
+                    if match:
+                        max_age = int(match.group(1))
                     _keys_expiry = now + max_age
-        except Exception as e: print(f"[TeraBridge][ERROR] Failed to fetch Google public keys: {e}", flush=True)
+        except Exception as e:
+            print(f"[TeraBridge][ERROR] Failed to fetch Google public keys: {e}", flush=True)
     return _google_public_keys
 
 async def verify_firebase_token(request: Request, token):
     global _recent_auth_errors
-    if not token: return False
+    if not token:
+        return False
     try:
         request.state.firebase_token = token
         public_keys = await get_google_public_keys()
@@ -370,21 +482,39 @@ async def verify_firebase_token(request: Request, token):
         public_key = public_keys.get(kid)
         if not public_key:
             err_msg = f"Public key for kid '{kid}' not found."
-            _recent_auth_errors.append({"timestamp": time.time(), "error": err_msg})
-            if len(_recent_auth_errors) > 10: _recent_auth_errors.pop(0)
+            print(f"[Auth][ERROR] {err_msg}", flush=True)
+            _recent_auth_errors.append({
+                "timestamp": time.time(),
+                "error": err_msg
+            })
+            if len(_recent_auth_errors) > 10:
+                _recent_auth_errors.pop(0)
             return False
             
         from cryptography.x509 import load_pem_x509_certificate
         cert_obj = load_pem_x509_certificate(public_key.encode())
         public_key_obj = cert_obj.public_key()
         
-        decoded = jwt.decode(token, public_key_obj, algorithms=["RS256"], audience=FIREBASE_PROJECT_ID, issuer=f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}")
+        decoded = jwt.decode(
+            token,
+            public_key_obj,
+            algorithms=["RS256"],
+            audience=FIREBASE_PROJECT_ID,
+            issuer=f"https://securetoken.google.com/{FIREBASE_PROJECT_ID}"
+        )
         request.state.user = decoded
         return True
     except Exception as e:
         import traceback
-        _recent_auth_errors.append({"timestamp": time.time(), "error": str(e), "traceback": traceback.format_exc()})
-        if len(_recent_auth_errors) > 10: _recent_auth_errors.pop(0)
+        err_msg = f"{str(e)}\n{traceback.format_exc()}"
+        print(f"[Auth][ERROR] Firebase JWT verification failed: {err_msg}", flush=True)
+        _recent_auth_errors.append({
+            "timestamp": time.time(),
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        })
+        if len(_recent_auth_errors) > 10:
+            _recent_auth_errors.pop(0)
         return False
 
 def _extract_api_key(request: Request, body_json=None, exclude_jwt=False):
@@ -393,19 +523,29 @@ def _extract_api_key(request: Request, body_json=None, exclude_jwt=False):
         auth_header = request.headers.get("Authorization") or ""
         if auth_header.startswith("Bearer "):
             bearer_token = auth_header[len("Bearer "):].strip()
-            if not (exclude_jwt and bearer_token.count(".") == 2): client_key = bearer_token
-    if not client_key: client_key = request.query_params.get("key") or request.query_params.get("api_key")
-    if not client_key and body_json is not None: client_key = body_json.get("key") or body_json.get("api_key")
+            if not (exclude_jwt and bearer_token.count(".") == 2):
+                client_key = bearer_token
+
+    if not client_key:
+        client_key = request.query_params.get("key") or request.query_params.get("api_key")
+
+    if not client_key and body_json is not None:
+        client_key = body_json.get("key") or body_json.get("api_key")
+
     return client_key
 
 async def check_auth(request: Request):
     request.state.auth_type = None
+
     body_json = None
     if "application/json" in request.headers.get("content-type", ""):
-        try: body_json = await request.json()
-        except Exception: pass
+        try:
+            body_json = await request.json()
+        except Exception:
+            pass
 
     client_key = _extract_api_key(request, body_json)
+
     if client_key and client_key.count(".") == 2:
         if await verify_firebase_token(request, client_key):
             request.state.auth_type = "firebase"
@@ -414,7 +554,8 @@ async def check_auth(request: Request):
 
     if not client_key:
         if not API_KEY:
-            if REQUIRE_API_KEY: return False
+            if REQUIRE_API_KEY:
+                return False
             request.state.auth_type = "anonymous"
             return True
         return False
@@ -422,21 +563,41 @@ async def check_auth(request: Request):
     if API_KEY and hmac.compare_digest(client_key, API_KEY):
         request.state.auth_type = "admin"
         return True
+
     return False
 
 async def check_admin(request: Request):
-    if not API_KEY: return False
+    if not API_KEY:
+        return False
+
     body_json = None
     if "application/json" in request.headers.get("content-type", ""):
-        try: body_json = await request.json()
-        except Exception: pass
+        try:
+            body_json = await request.json()
+        except Exception:
+            pass
+
     client_key = _extract_api_key(request, body_json, exclude_jwt=True)
-    if not client_key: return False
+
+    if not client_key:
+        return False
+
     return hmac.compare_digest(client_key, API_KEY)
 
+# ─── HMAC Signature Helpers for URL Security ──────────────────────────
 TIERED_SIGNATURE_TTLS = {
-    "free": { "segment": 30 * 60, "download": 2 * 3600, "manifest": 24 * 3600, "thumbnail": 24 * 3600 },
-    "premium": { "segment": 2 * 3600, "download": 24 * 3600, "manifest": 30 * 24 * 3600, "thumbnail": 30 * 24 * 3600 }
+    "free": {
+        "segment":   int(os.environ.get("SIG_TTL_SEGMENT_FREE",   30 * 60)),
+        "download":  int(os.environ.get("SIG_TTL_DOWNLOAD_FREE",  2 * 3600)),
+        "manifest":  int(os.environ.get("SIG_TTL_MANIFEST_FREE",  24 * 3600)),
+        "thumbnail": int(os.environ.get("SIG_TTL_THUMBNAIL_FREE", 24 * 3600)),
+    },
+    "premium": {
+        "segment":   int(os.environ.get("SIG_TTL_SEGMENT_PREMIUM",   2 * 3600)),
+        "download":  int(os.environ.get("SIG_TTL_DOWNLOAD_PREMIUM",  24 * 3600)),
+        "manifest":  int(os.environ.get("SIG_TTL_MANIFEST_PREMIUM",  30 * 24 * 3600)),
+        "thumbnail": int(os.environ.get("SIG_TTL_THUMBNAIL_PREMIUM", 30 * 24 * 3600)),
+    }
 }
 DEFAULT_SIGNATURE_TTL = int(os.environ.get("SIG_TTL_DEFAULT", 24 * 3600))
 
@@ -445,54 +606,76 @@ _user_tier_cache_lock = threading.Lock()
 USER_TIER_CACHE_TTL = 300
 
 def get_user_tier(request: Request = None):
-    if not request: return "free"
+    if not request:
+        return "free"
+
     auth_type = getattr(request.state, "auth_type", None)
-    if auth_type == "admin": return "premium"
+    if auth_type == "admin":
+        return "premium"
+
     user = getattr(request.state, "user", None)
-    if not user: return "free"
+    if not user:
+        return "free"
 
     tier = user.get("tier") or user.get("role")
     if tier:
         tier_str = str(tier).lower()
-        if "premium" in tier_str or "pro" in tier_str: return "premium"
+        if "premium" in tier_str or "pro" in tier_str:
+            return "premium"
         return "free"
 
     uid = user.get("user_id") or user.get("sub")
-    if not uid: return "free"
+    if not uid:
+        return "free"
 
     now = time.time()
     with _user_tier_cache_lock:
         if uid in _user_tier_cache:
             cached_tier, expiry = _user_tier_cache[uid]
-            if now < expiry: return cached_tier
+            if now < expiry:
+                return cached_tier
 
     if redis_client:
         try:
             redis_key = f"user:tier:{uid}"
             cached_tier = redis_client.get(redis_key)
             if cached_tier:
-                if isinstance(cached_tier, bytes): cached_tier = cached_tier.decode('utf-8')
-                with _user_tier_cache_lock: _user_tier_cache[uid] = (cached_tier, now + USER_TIER_CACHE_TTL)
+                if isinstance(cached_tier, bytes):
+                    cached_tier = cached_tier.decode('utf-8')
+                with _user_tier_cache_lock:
+                    _user_tier_cache[uid] = (cached_tier, now + USER_TIER_CACHE_TTL)
                 return cached_tier
-        except Exception: pass
+        except Exception as e:
+            print(f"[TeraBridge][WARN] Redis user tier cache get error: {e}", flush=True)
 
     token = getattr(request.state, "firebase_token", None)
     if token:
         try:
             url = f"https://{FIREBASE_PROJECT_ID}-default-rtdb.asia-southeast1.firebasedatabase.app/users/{uid}/profile/tier.json?auth={token}"
-            with httpx.Client() as client: r = client.get(url, timeout=5)
+            with httpx.Client() as client:
+                r = client.get(url, timeout=5)
             if r.status_code == 200:
                 db_tier = r.json()
                 resolved_tier = "free"
                 if db_tier:
                     tier_str = str(db_tier).lower()
-                    if "premium" in tier_str or "pro" in tier_str: resolved_tier = "premium"
-                with _user_tier_cache_lock: _user_tier_cache[uid] = (resolved_tier, now + USER_TIER_CACHE_TTL)
+                    if "premium" in tier_str or "pro" in tier_str:
+                        resolved_tier = "premium"
+
+                with _user_tier_cache_lock:
+                    _user_tier_cache[uid] = (resolved_tier, now + USER_TIER_CACHE_TTL)
+
                 if redis_client:
-                    try: redis_client.set(f"user:tier:{uid}", resolved_tier, ex=USER_TIER_CACHE_TTL)
-                    except Exception: pass
+                    try:
+                        redis_key = f"user:tier:{uid}"
+                        redis_client.set(redis_key, resolved_tier, ex=USER_TIER_CACHE_TTL)
+                    except Exception as e:
+                        print(f"[TeraBridge][WARN] Redis user tier cache set error: {e}", flush=True)
+
                 return resolved_tier
-        except Exception: pass
+        except Exception as e:
+            print(f"[TeraBridge][WARN] Failed to fetch user tier from Firebase DB: {e}", flush=True)
+
     return "free"
 
 def signature_ttl_for(kind, tier="free"):
@@ -500,34 +683,48 @@ def signature_ttl_for(kind, tier="free"):
     return ttls.get(kind, DEFAULT_SIGNATURE_TTL)
 
 def generate_signature(param1, param2, param3="", exp=""):
-    if not HMAC_SECRET: return ""
-    message = f"{param1}|{param2}|{param3}|{exp}" if exp != "" else f"{param1}|{param2}|{param3}"
+    if not HMAC_SECRET:
+        return ""
+    if exp != "":
+        message = f"{param1}|{param2}|{param3}|{exp}"
+    else:
+        message = f"{param1}|{param2}|{param3}"
     return hmac.new(HMAC_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 def make_signed_params(request: Request, param1, param2, param3="", kind="download"):
-    if not HMAC_SECRET: return ""
+    if not HMAC_SECRET:
+        return ""
     tier = get_user_tier(request)
     exp = int(time.time()) + signature_ttl_for(kind, tier)
     sig = generate_signature(param1, param2, param3, exp)
     return f"sig={sig}&exp={exp}"
 
 def verify_signature(param1, param2, param3, signature, exp=""):
-    if not signature or not HMAC_SECRET: return False
+    if not signature or not HMAC_SECRET:
+        return False
+
     if exp:
         try:
-            if int(exp) < int(time.time()): return False
-        except (TypeError, ValueError): return False
+            if int(exp) < int(time.time()):
+                return False
+        except (TypeError, ValueError):
+            return False
         expected = generate_signature(param1, param2, param3, exp)
-        if not expected: return False
+        if not expected:
+            return False
         return hmac.compare_digest(expected, signature)
 
     expected_legacy = generate_signature(param1, param2, param3, "")
     if expected_legacy and hmac.compare_digest(expected_legacy, signature):
+        print("[TeraBridge][WARN] Accepted legacy un-expiring signed URL "
+              f"(p1={param1[:24]}...). Consider re-resolving to refresh.", flush=True)
         return True
     return False
 
+# ─── Startup timestamp ──────────────────────────────────────────────
 _start_time = time.time()
 
+# ─── Routes ──────────────────────────────────────────────────────────
 @app.get("/")
 def home():
     uptime = int(time.time() - _start_time)
@@ -537,14 +734,15 @@ def home():
         "version": "2.0.0",
         "uptime_seconds": uptime,
         "endpoints": {
-            "/api/resolve": "Resolve share links. Params: url (required)",
+            "/api/resolve": "Resolve share links. Params: url (required), mode [download|stream|list] (optional)",
             "/api/stats": "View cache, rate limiter, and server statistics",
         }
     }
 
 @app.get("/api/stats")
 async def stats(request: Request):
-    if not await check_admin(request): return JSONResponse({"status": "error", "message": "Unauthorized: Admin API key required."}, status_code=401)
+    if not await check_admin(request):
+        return JSONResponse({"status": "error", "message": "Unauthorized: Admin API key required."}, status_code=401)
     uptime = int(time.time() - _start_time)
     redis_status = "connected" if redis_client else "disabled"
     
@@ -558,12 +756,17 @@ async def stats(request: Request):
                     "last_checked_timestamp": status_data.get("last_checked"),
                     "message": status_data.get("message")
                 }
-        except Exception: pass
+        except Exception:
+            pass
 
     return {
-        "status": "online", "uptime_seconds": uptime, "redis": redis_status,
-        "session_health": session_health, "cache": cache.stats(),
-        "rate_limiter": rate_limiter.stats(), "firebase_project_id": FIREBASE_PROJECT_ID,
+        "status": "online",
+        "uptime_seconds": uptime,
+        "redis": redis_status,
+        "session_health": session_health,
+        "cache": cache.stats(),
+        "rate_limiter": rate_limiter.stats(),
+        "firebase_project_id": FIREBASE_PROJECT_ID,
         "recent_auth_errors": _recent_auth_errors
     }
 
@@ -575,13 +778,15 @@ async def resolve_link_with_retry(link, action="d", wait_for_transcoding=False, 
             accounts = get_all_accounts()
             healthy_count = sum(1 for data in accounts.values() if data.get("status", "healthy") == "healthy")
             max_retries = max(3, healthy_count)
-        except Exception: pass
+        except Exception:
+            pass
     res = {}
     
     for attempt in range(max_retries):
         active_id = _current_active_account_id
         res = await resolve_link(link, action=action, wait_for_transcoding=wait_for_transcoding, quality=quality)
         
+        # Identify account-level errors
         is_account_error = False
         reason = "unknown"
         errno = res.get("errno")
@@ -597,6 +802,7 @@ async def resolve_link_with_retry(link, action="d", wait_for_transcoding=False, 
             is_account_error = True
             reason = f"Session expired/invalid (errno {errno})"
             
+        # Check files for storage full or auth errors
         is_transient_rotation = False
         if not is_account_error and res.get("errno") == 0:
             files = res.get("files", [])
@@ -614,25 +820,38 @@ async def resolve_link_with_retry(link, action="d", wait_for_transcoding=False, 
                     elif "400810" in err_msg:
                         transient_failure_count += 1
                         reason = "Temporary transfer rate-limit or restriction (errno 400810)"
-                if account_failure_count == len(files): is_account_error = True
-                elif transient_failure_count == len(files): is_transient_rotation = True
+                if account_failure_count == len(files):
+                    is_account_error = True
+                elif transient_failure_count == len(files):
+                    is_transient_rotation = True
                     
         if is_account_error and active_id:
             print(f"[TeraBridge] Account '{active_id}' hit account-level failure: {reason}. Marking UNHEALTHY.", flush=True)
             mark_account_unhealthy(active_id, reason)
+            # Rotate config
             load_config_from_redis()
-            if attempt < max_retries - 1: continue
+            if attempt < max_retries - 1:
+                print(f"[TeraBridge] Retrying resolution using rotated account: {_current_active_account_id}", flush=True)
+                continue
         elif is_transient_rotation and active_id:
             print(f"[TeraBridge] Account '{active_id}' hit transient limit: {reason}. Rotating to another healthy account...", flush=True)
+            # Force rotation to next healthy account in pool
             get_next_healthy_account()
             load_config_from_redis()
-            if attempt < max_retries - 1: continue
+            if attempt < max_retries - 1:
+                print(f"[TeraBridge] Retrying resolution using rotated account: {_current_active_account_id}", flush=True)
+                continue
+                
         break
+        
     return res
 
+# ─── Helper: Format resolve_link outputs to API proxy format ──────────
 def _format_resolved_response(request: Request, res, link):
+    is_transcoding = any(f.get("error") == "transcoding_in_progress" for f in res.get("files", []))
+    
     response_data = {
-        "status": "success",
+        "status": "transcoding" if is_transcoding else "success",
         "title": res.get("title"),
         "share_id": res.get("share_id"),
         "uk": res.get("uk"),
@@ -663,20 +882,26 @@ def _format_resolved_response(request: Request, res, link):
         else:
             proxy_dlink = dlink_url
 
-        # [FIX 3] Set stream_url to proxy_dlink directly and supply _real_dlink
+# চেক করবে ফাইলটি ভিডিও কি না
         filename = f.get("filename", "")
         is_video = bool(filename and filename.lower().endswith(VIDEO_EXTS))
+        
+        # ভিডিও হলে স্ট্রিমিং লিংক দিয়ে দিবে (রেডি না হলেও)
+        if (f.get("stream_ready") or is_video) and original_fs_id and surl:
+            signed = make_signed_params(request, surl, original_fs_id, "manifest", kind="manifest")
+            proxy_stream = f"{_request_base_url(request)}/api/stream/manifest?surl={surl}&fs_id={original_fs_id}&{signed}"
+        else:
+            proxy_stream = None
 
         file_info = {
-            "filename": filename,
+            "filename": f.get("filename"),
             "size_bytes": f.get("size_bytes"),
             "size_mb": f.get("size_mb"),
             "fs_id": f.get("fs_id"),
             "transfer_status": f.get("transfer_status"),
             "dlink": proxy_dlink,
-            "_real_dlink": dlink_url, # Hidden key for proxy stream to prevent infinite looping
-            "stream_url": proxy_dlink if is_video else None,
-            "stream_ready": True if is_video else False,
+            "stream_url": proxy_stream,
+            "stream_ready": f.get("stream_ready"),
             "error": f.get("error"),
             "thumbnails": proxied_thumbs if proxied_thumbs else None,
             "path": f.get("path"),
@@ -684,8 +909,72 @@ def _format_resolved_response(request: Request, res, link):
         }
         response_data["files"].append(file_info)
         
-    return response_data, False
+    return response_data, is_transcoding
 
+# ─── Background Quality Pre-Warming ─────────────────────────────────
+async def _prewarm_quality_cache(link, res):
+    import downloader
+
+    try:
+        files = res.get("files", [])
+        for file_index, f in enumerate(files):
+            filename = f.get("filename", "")
+            if not (filename and filename.lower().endswith(VIDEO_EXTS)):
+                continue
+
+            existing = cache.get(link, f"qualities:{file_index}", False)
+            if existing:
+                continue
+
+            my_file_path = downloader.ROOT_PATH.rstrip("/") + "/" + filename
+            encoded_path = urllib.parse.quote(my_file_path)
+
+            qualities_to_check = {
+                "1080p": "M3U8_AUTO_1080",
+                "720p": "M3U8_AUTO_720",
+                "480p": "M3U8_AUTO_480",
+                "360p": "M3U8_AUTO_360"
+            }
+
+            matching_file = f
+            ready_qualities = {}
+
+            async def check_quality(qname, qtype):
+                url = f"{downloader.BASE_API}/api/streaming?{downloader.qp()}&path={encoded_path}&type={qtype}&bdstoken={downloader.BDSTOKEN}"
+                try:
+                    sr = await downloader.get_session().get(url, timeout=15.0)
+                    if sr.status_code == 200 and "#EXTM3U" in sr.text:
+                        return qname, {
+                            "fs_id": matching_file.get("original_fs_id") or matching_file.get("fs_id")
+                        }
+                except Exception as e:
+                    print(f"[PreWarm][ERROR] Quality {qname}: {e}", flush=True)
+                return qname, None
+
+            tasks = [check_quality(qname, qtype) for qname, qtype in qualities_to_check.items()]
+            quality_results = await asyncio.gather(*tasks)
+            for qname, res_data in quality_results:
+                if res_data:
+                    ready_qualities[qname] = res_data
+
+            if ready_qualities:
+                key = cache._make_key(link, f"qualities:{file_index}", False)
+                if redis_client:
+                    try:
+                        redis_key = f"cache:response:{key}"
+                        redis_client.set(redis_key, json.dumps(ready_qualities), ex=86400)
+                    except Exception as e:
+                        print(f"[PreWarm][WARN] Redis cache save error: {e}", flush=True)
+                else:
+                    cache.put(link, f"qualities:{file_index}", False, ready_qualities)
+                print(f"[PreWarm] Cached qualities for file {file_index}: {list(ready_qualities.keys())}", flush=True)
+            else:
+                print(f"[PreWarm] No streamable qualities found for file {file_index}", flush=True)
+
+    except Exception as e:
+        print(f"[PreWarm][ERROR] Background quality pre-warm failed: {e}", flush=True)
+
+# ─── Single Flight (Request Collapsing) locks ────────────────────────
 _single_flight_events = {}
 _single_flight_lock = threading.Lock()
 
@@ -694,17 +983,21 @@ def acquire_resolve_lock(key):
         try:
             is_locked = redis_client.set(f"lock:resolve:{key}", "locked", nx=True, ex=30)
             return bool(is_locked)
-        except Exception: pass
+        except Exception as e:
+            print(f"[SingleFlight][WARN] Redis lock set error: {e}", flush=True)
             
     with _single_flight_lock:
-        if key in _single_flight_events: return False
+        if key in _single_flight_events:
+            return False
         _single_flight_events[key] = threading.Event()
         return True
 
 def release_resolve_lock(key):
     if redis_client:
-        try: redis_client.delete(f"lock:resolve:{key}")
-        except Exception: pass
+        try:
+            redis_client.delete(f"lock:resolve:{key}")
+        except Exception as e:
+            print(f"[SingleFlight][WARN] Redis lock delete error: {e}", flush=True)
             
     with _single_flight_lock:
         if key in _single_flight_events:
@@ -713,69 +1006,492 @@ def release_resolve_lock(key):
 
 async def wait_for_resolution(key, check_cache_func, timeout=30):
     start = time.time()
+    
     if redis_client:
         while time.time() - start < timeout:
             cached = check_cache_func()
-            if cached is not None: return cached
-            if not redis_client.exists(f"lock:resolve:{key}"): break
+            if cached is not None:
+                return cached
+            if not redis_client.exists(f"lock:resolve:{key}"):
+                break
             await asyncio.sleep(1.0)
         return check_cache_func()
 
     event = None
     with _single_flight_lock:
         event = _single_flight_events.get(key)
-    if event: await asyncio.to_thread(event.wait, timeout=timeout)
+        
+    if event:
+        await asyncio.to_thread(event.wait, timeout=timeout)
+        
     return check_cache_func()
 
+# ─── Background Transcoder Polling Worker ────────────────────────────
+_transcode_jobs_lock = threading.Lock()
+_active_transcode_jobs = set()
+
+async def _background_transcode_poll(link, action, cache_key):
+    lock_key = f"lock:transcode:{cache_key}"
+    
+    if redis_client:
+        try:
+            if not redis_client.set(lock_key, "running", nx=True, ex=300):
+                return
+        except Exception:
+            pass
+    else:
+        with _transcode_jobs_lock:
+            if cache_key in _active_transcode_jobs:
+                return
+            _active_transcode_jobs.add(cache_key)
+
+    print(f"[TranscoderWorker] Starting background transcoding checks for: {link}", flush=True)
+    try:
+        res = await resolve_link_with_retry(link, action=action, wait_for_transcoding=True)
+        if res.get("errno") == 0:
+            # Fake a request to check user tier or just pass None
+            response_data, is_transcoding = _format_resolved_response(None, res, link)
+            
+            if not is_transcoding:
+                cache.put(link, action, False, response_data)
+                cache.put(link, action, True, response_data)
+                
+                video_title = res.get("title", "Unknown Video")
+                alert_msg = f"🎉 **HLS Transcoding Complete!**\nVideo **{video_title}** has finished transcoding and is ready for streaming."
+                await send_webhook_alert(alert_msg)
+                print(f"[TranscoderWorker] Success: transcoding complete for: {link}", flush=True)
+                return
+                
+        print(f"[TranscoderWorker] Finished polling, but transcoding is still incomplete for: {link}", flush=True)
+    except Exception as e:
+        print(f"[TranscoderWorker][ERROR] Exception during background transcode: {e}", flush=True)
+    finally:
+        if redis_client:
+            try:
+                redis_client.delete(lock_key)
+            except Exception:
+                pass
+        else:
+            with _transcode_jobs_lock:
+                _active_transcode_jobs.discard(cache_key)
+
+# ─── Main API Resolution Route ───────────────────────────────────────
 @app.api_route("/api/resolve", methods=["GET", "POST"])
 async def resolve(request: Request):
-    if not await check_auth(request): return JSONResponse({"status": "error", "message": "Unauthorized."}, status_code=401)
+    if not await check_auth(request):
+        return JSONResponse({"status": "error", "message": "Unauthorized: Invalid or missing API key."}, status_code=401)
 
     client_ip = _client_ip(request)
+
     if not rate_limiter.is_allowed(client_ip):
         remaining = rate_limiter.remaining(client_ip)
-        return JSONResponse({"status": "error", "message": f"Rate limit exceeded."}, status_code=429, headers={"X-RateLimit-Remaining": str(remaining)})
+        return JSONResponse({
+            "status": "error",
+            "message": f"Rate limit exceeded. Max {RATE_LIMIT_RPM} requests per minute. Try again shortly.",
+        }, status_code=429, headers={
+            "Retry-After": str(RATE_LIMIT_WINDOW),
+            "X-RateLimit-Limit": str(RATE_LIMIT_RPM),
+            "X-RateLimit-Remaining": str(remaining)
+        })
 
     link = ""
+    action = "d"
+    wait_for_transcoding = False
+
     if request.method == "POST":
-        try: data = await request.json()
-        except: data = {}
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
         link = data.get("url") or data.get("link") or ""
+        action = data.get("mode") or data.get("action") or "d"
+        wait_for_transcoding = bool(data.get("wait"))
     else:
         link = request.query_params.get("url") or request.query_params.get("link") or ""
+        action = request.query_params.get("mode") or request.query_params.get("action") or "d"
+        wait_for_transcoding = request.query_params.get("wait") in ("true", "1", "True")
 
-    if not link: return JSONResponse({"status": "error", "message": "Missing 'url'"}, status_code=400)
+    if not link:
+        return JSONResponse({
+            "status": "error",
+            "message": "Missing required parameter 'url' or 'link'."
+        }, status_code=400)
+
     link = re.sub(r'[\s\u200b\u200c\u200d\ufeff\u202a\u202b\u202c\u202d\u202e]+', '', link)
 
-    # We only use 'd' (download logic) for optimized flow
-    action = "d" 
-    wait_for_transcoding = False
+    act_lower = action.lower()
+    if act_lower in ("s", "stream", "streaming"):
+        action = "s"
+    elif act_lower in ("l", "list", "info", "metadata"):
+        action = "l"
+    else:
+        action = "d"
 
     cached = cache.get(link, action, wait_for_transcoding)
     if cached is not None:
-        return JSONResponse(cached, headers={"X-Cache": "HIT", "X-RateLimit-Remaining": str(rate_limiter.remaining(client_ip))})
+        return JSONResponse(cached, headers={
+            "X-Cache": "HIT",
+            "X-RateLimit-Remaining": str(rate_limiter.remaining(client_ip))
+        })
 
     cache_key = cache._make_key(link, action, wait_for_transcoding)
     has_lock = acquire_resolve_lock(cache_key)
     
     if not has_lock:
+        print(f"[SingleFlight] Waiting for concurrent resolution of: {link}", flush=True)
         cached = await wait_for_resolution(cache_key, lambda: cache.get(link, action, wait_for_transcoding), timeout=30)
         if cached is not None:
-            return JSONResponse(cached, headers={"X-Cache": "HIT (COLLAPSED)", "X-RateLimit-Remaining": str(rate_limiter.remaining(client_ip))})
+            return JSONResponse(cached, headers={
+                "X-Cache": "HIT (COLLAPSED)",
+                "X-RateLimit-Remaining": str(rate_limiter.remaining(client_ip))
+            })
+        print(f"[SingleFlight] Wait timed out, proceeding to resolve ourselves: {link}", flush=True)
         acquire_resolve_lock(cache_key)
 
     try:
         res = await resolve_link_with_retry(link, action=action, wait_for_transcoding=wait_for_transcoding)
         if res.get("errno") != 0:
-            return JSONResponse({"status": "error", "message": res.get("error", "Unknown error")}, status_code=400)
+            return JSONResponse({
+                "status": "error",
+                "message": res.get("error", "Unknown resolution error occurred.")
+            }, status_code=400)
 
-        response_data, _ = _format_resolved_response(request, res, link)
-        cache.put(link, action, wait_for_transcoding, response_data)
+        response_data, is_transcoding = _format_resolved_response(request, res, link)
 
-        return JSONResponse(response_data, headers={"X-Cache": "MISS", "X-RateLimit-Remaining": str(rate_limiter.remaining(client_ip))})
-    except ValueError as e: return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
-    except Exception as e: return JSONResponse({"status": "error", "message": f"Server exception: {str(e)}"}, status_code=500)
-    finally: release_resolve_lock(cache_key)
+        if is_transcoding and not wait_for_transcoding:
+            asyncio.create_task(_background_transcode_poll(link, action, cache_key))
+
+        if action == "s" and not is_transcoding:
+            asyncio.create_task(_prewarm_quality_cache(link, res))
+
+        if not is_transcoding:
+            cache.put(link, action, wait_for_transcoding, response_data)
+
+        return JSONResponse(response_data, headers={
+            "X-Cache": "MISS",
+            "X-RateLimit-Remaining": str(rate_limiter.remaining(client_ip))
+        })
+
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({
+            "status": "error",
+            "message": f"Server encountered exception: {str(e)}"
+        }, status_code=500)
+    finally:
+        release_resolve_lock(cache_key)
+
+# ─── HLS Streaming Proxy routes ─────────────────────────────────────
+@app.api_route("/api/stream/manifest", methods=["GET", "OPTIONS"])
+@app.api_route("/api/stream/playlist.m3u8", methods=["GET", "OPTIONS"])
+async def stream_manifest(request: Request):
+    surl = request.query_params.get("surl") or ""
+    fs_id = request.query_params.get("fs_id") or ""
+    sig = request.query_params.get("sig") or ""
+    exp = request.query_params.get("exp") or ""
+    link = request.query_params.get("url") or request.query_params.get("link") or ""
+    
+    if not surl and link:
+        try:
+            surl = parse_surl(link)
+        except Exception:
+            pass
+
+    is_authorized = (
+        (surl and fs_id and sig and verify_signature(surl, fs_id, "manifest", sig, exp))
+        or await check_auth(request)
+    )
+    if not is_authorized:
+        return JSONResponse({"status": "error", "message": "Unauthorized: Invalid signature or authentication."}, status_code=401)
+
+    client_ip = _client_ip(request)
+
+    if not rate_limiter.is_allowed(client_ip):
+        return JSONResponse({
+            "status": "error",
+            "message": f"Rate limit exceeded. Try again shortly.",
+        }, status_code=429)
+
+    if not link and surl:
+        link = f"https://1024terabox.com/s/{surl}"
+
+    wait_for_transcoding = request.query_params.get("wait") in ("true", "1", "True")
+    
+    try:
+        file_index = int(request.query_params.get("index", 0))
+    except ValueError:
+        file_index = 0
+
+    if not link:
+        return JSONResponse({
+            "status": "error",
+            "message": "Missing required parameter 'url', 'link' or 'surl'."
+        }, status_code=400)
+
+    quality = request.query_params.get("quality") or request.query_params.get("type") or ""
+
+    qualities_to_check = {
+        "1080p": "M3U8_AUTO_1080",
+        "720p": "M3U8_AUTO_720",
+        "480p": "M3U8_AUTO_480",
+        "360p": "M3U8_AUTO_360"
+    }
+
+    try:
+        if not quality:
+            ready_qualities = cache.get(link, f"qualities:{file_index}", False)
+            if ready_qualities:
+                print(f"[Manifest] Cache HIT for available qualities: {link} -> {list(ready_qualities.keys())}", flush=True)
+            else:
+                print(f"[Manifest] Cache MISS for available qualities: {link}. Resolving...", flush=True)
+                res = await resolve_link_with_retry(link, action="s", wait_for_transcoding=wait_for_transcoding)
+                if res.get("errno") != 0:
+                    return JSONResponse({"status": "error", "message": res.get("error", "Unknown resolution error occurred.")}, status_code=400)
+
+                files = res.get("files", [])
+                matching_file = None
+                if fs_id and files:
+                    for f in files:
+                        if str(f.get("original_fs_id")) == str(fs_id) or str(f.get("fs_id")) == str(fs_id):
+                            matching_file = f
+                            break
+                if not matching_file and files and file_index < len(files):
+                    matching_file = files[file_index]
+
+                if not matching_file:
+                    return JSONResponse({"status": "error", "message": "No streamable video files found in this share link."}, status_code=404)
+
+                filename = matching_file.get("filename")
+                is_video = bool(filename and filename.lower().endswith(VIDEO_EXTS))
+
+                if not is_video:
+                    return JSONResponse({"status": "error", "message": "Selected file is not a streamable video."}, status_code=400)
+
+                is_transcoding = any(f.get("error") == "transcoding_in_progress" for f in files)
+                if is_transcoding and not any(f.get("stream_ready") for f in files):
+                    return JSONResponse({
+                        "status": "transcoding",
+                        "message": "HLS streaming manifest is currently transcoding. Please try again shortly."
+                    }, status_code=202)
+
+                import downloader
+                my_file_path = downloader.ROOT_PATH.rstrip("/") + "/" + filename
+                encoded_path = urllib.parse.quote(my_file_path)
+
+                ready_qualities = {}
+
+                async def check_streaming_quality(qname, qtype):
+                    url = (
+                        f"{downloader.BASE_API}/api/streaming?{downloader.qp()}&path={encoded_path}&type={qtype}"
+                        f"&bdstoken={downloader.BDSTOKEN}&isplayer=1&check_blue=1&clienttype=1&resolution={qname}"
+                    )
+                    try:
+                        sr = await downloader.get_session().get(url, timeout=15.0)
+                        if sr.status_code == 200 and "#EXTM3U" in sr.text:
+                            return qname, {
+                                "fs_id": matching_file.get("original_fs_id") or matching_file.get("fs_id")
+                            }
+                    except Exception as e:
+                        print(f"[Manifest][ERROR] Failed to check quality {qname}: {e}", flush=True)
+                    return qname, None
+
+                tasks = [check_streaming_quality(qname, qtype) for qname, qtype in qualities_to_check.items()]
+                quality_results = await asyncio.gather(*tasks)
+                for qname, res_data in quality_results:
+                    if res_data:
+                        ready_qualities[qname] = res_data
+
+                if not ready_qualities:
+                    return JSONResponse({
+                        "status": "error",
+                        "message": "No streamable qualities are ready or transcoding for this video."
+                    }, status_code=404)
+
+                key = cache._make_key(link, f"qualities:{file_index}", False)
+                if redis_client:
+                    try:
+                        redis_key = f"cache:response:{key}"
+                        ttl = 86400 if not is_transcoding else 120
+                        redis_client.set(redis_key, json.dumps(ready_qualities), ex=ttl)
+                    except Exception as e:
+                        print(f"[Manifest][WARN] Redis cache save error: {e}", flush=True)
+                else:
+                    cache.put(link, f"qualities:{file_index}", False, ready_qualities)
+
+            # Build multivariant master playlist
+            base_url = _request_base_url(request)
+            playlist = ["#EXTM3U", "#EXT-X-VERSION:3"]
+            
+            qualities = [
+                ("1080p", "4000000", "1920x1080"),
+                ("720p",  "2500000", "1280x720"),
+                ("480p",  "1200000", "854x480"),
+                ("360p",  "60000",   "640x360")
+            ]
+
+            for qname, bandwidth, res_str in qualities:
+                if qname in ready_qualities:
+                    q_fs_id = ready_qualities[qname]["fs_id"]
+                    signed = make_signed_params(request, surl, q_fs_id, "manifest", kind="manifest")
+                    stream_url = (
+                        f"{base_url}/api/stream/playlist.m3u8"
+                        f"?surl={surl}&fs_id={q_fs_id}&quality={qname}&{signed}"
+                    )
+                    playlist.append(
+                        f"#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},"
+                        f"RESOLUTION={res_str}"
+                    )
+                    playlist.append(stream_url)
+
+            return Response(content="\n".join(playlist), media_type="application/x-mpegURL")
+
+        # CASE 2: Specific quality playlist
+        qtype = qualities_to_check.get(quality)
+        if not qtype:
+            return JSONResponse({"status": "error", "message": f"Unsupported stream quality: {quality}"}, status_code=400)
+
+        import downloader
+        res = await resolve_link_with_retry(link, action="s", wait_for_transcoding=wait_for_transcoding)
+        if res.get("errno") != 0:
+            return JSONResponse({"status": "error", "message": res.get("error", "Failed to resolve link.")}, status_code=400)
+
+        files = res.get("files", [])
+        matching_file = None
+        if fs_id and files:
+            for f in files:
+                if str(f.get("original_fs_id")) == str(fs_id) or str(f.get("fs_id")) == str(fs_id):
+                    matching_file = f
+                    break
+        if not matching_file and files and file_index < len(files):
+            matching_file = files[file_index]
+
+        if not matching_file:
+            return JSONResponse({"status": "error", "message": "File not found."}, status_code=404)
+
+        filename = matching_file.get("filename")
+        my_file_path = downloader.ROOT_PATH.rstrip("/") + "/" + filename
+        encoded_path = urllib.parse.quote(my_file_path)
+
+        url = (
+            f"{downloader.BASE_API}/api/streaming?{downloader.qp()}&path={encoded_path}&type={qtype}"
+            f"&bdstoken={downloader.BDSTOKEN}&isplayer=1&check_blue=1&clienttype=1&resolution={quality}"
+        )
+        
+        sr = await downloader.get_session().get(url, timeout=20.0)
+        if sr.status_code != 200 or "#EXTM3U" not in sr.text:
+            return JSONResponse({"status": "error", "message": f"Failed to retrieve stream from Terabox (status={sr.status_code})"}, status_code=500)
+
+        m3u8_text = sr.text
+        rewritten = []
+        base_url = _request_base_url(request)
+
+        for line in m3u8_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("http://") or line.startswith("https://"):
+                signed = make_signed_params(request, line, "", "", kind="segment")
+                proxy_segment = f"{base_url}/api/stream/segment.ts?url={urllib.parse.quote(line)}&{signed}"
+                rewritten.append(proxy_segment)
+            else:
+                rewritten.append(line)
+
+        return Response(content="\n".join(rewritten), media_type="application/x-mpegURL")
+
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"Manifest proxy error: {str(e)}"}, status_code=500)
+
+@app.api_route("/api/stream/segment", methods=["GET", "OPTIONS"])
+@app.api_route("/api/stream/segment.ts", methods=["GET", "OPTIONS"])
+async def stream_segment(request: Request):
+    url = request.query_params.get("url") or ""
+    sig = request.query_params.get("sig") or ""
+    exp = request.query_params.get("exp") or ""
+    if not url:
+        return Response(content="Missing segment URL", status_code=400)
+
+    target_url = url
+
+    if not (sig and verify_signature(target_url, "", "", sig, exp)) and not await check_auth(request):
+        return Response(content="Unauthorized: Invalid signature or API key.", status_code=401)
+
+    # SSRF Protection
+    try:
+        parsed = urllib.parse.urlparse(target_url)
+        if parsed.scheme not in ("http", "https"):
+            return Response(content="Forbidden: Unsupported URL scheme.", status_code=403)
+        domain = parsed.hostname.lower() if parsed.hostname else ""
+        allowed_suffixes = (
+            ".1024terabox.com", ".terabox.com", ".teraboxapp.com", ".terabox.app", ".baidu.com",
+            ".freeterabox.com", ".nephobox.com", ".momerybox.com", ".mirrobox.com", ".gibibox.com",
+            ".tibibox.com", ".4funbox.com", ".1024tera.com", ".1024nephobox.com", ".terabox.fun",
+            ".terasharefile.com", ".teraboxlink.com", ".teraboxshare.com",
+            ".1024terabox.com-videotran-hybcloud", ".terabox.com-videotran-hybcloud",
+            ".teraboxapp.com-videotran-hybcloud", ".terabox.app-videotran-hybcloud",
+            ".freeterabox.com-videotran-hybcloud", ".nephobox.com-videotran-hybcloud",
+            ".momerybox.com-videotran-hybcloud", ".mirrobox.com-videotran-hybcloud",
+            ".gibibox.com-videotran-hybcloud", ".teraboxshare.com-videotran-hybcloud",
+            ".tibibox.com-videotran-hybcloud", ".4funbox.com-videotran-hybcloud",
+            ".1024tera.com-videotran-hybcloud", ".1024nephobox.com-videotran-hybcloud",
+            ".terabox.fun-videotran-hybcloud", ".terasharefile.com-videotran-hybcloud",
+            ".teraboxlink.com-videotran-hybcloud",
+            ".koofr.net", ".koofr.eu", "pcs.baidu.com", "d.pcs.1024terabox.com",
+        )
+
+        def _host_allowed(host, suffix):
+            if suffix.startswith("."):
+                return host == suffix[1:] or host.endswith(suffix)
+            return host == suffix
+
+        is_allowed = any(_host_allowed(domain, suffix) for suffix in allowed_suffixes)
+        if not is_allowed:
+            return Response(content="Forbidden: Invalid stream host destination.", status_code=403)
+    except Exception:
+        return Response(content="Invalid segment URL format", status_code=400)
+
+    if REDIRECT_SEGMENTS:
+        return RedirectResponse(url=target_url, status_code=307)
+
+    client = _proxy_client
+    try:
+        headers = {
+            "User-Agent": UA,
+            "Referer": "https://dm.1024terabox.com/",
+        }
+        range_header = request.headers.get("Range")
+        if range_header:
+            headers["Range"] = range_header
+
+        req_ctx = client.stream("GET", target_url, headers=headers, cookies=COOKIES_DICT, timeout=30.0)
+        req = await req_ctx.__aenter__()
+        
+        resp_headers = {}
+        cors_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+        }
+        
+        for key in ("Content-Length", "Content-Type", "Content-Range", "Accept-Ranges"):
+            if key in req.headers:
+                resp_headers[key] = req.headers[key]
+        
+        resp_headers.update(cors_headers)
+        
+        async def generate():
+            try:
+                async for chunk in req.aiter_bytes(chunk_size=65536):
+                    yield chunk
+            finally:
+                await req_ctx.__aexit__(None, None, None)
+
+        return StreamingResponse(generate(), status_code=req.status_code, headers=resp_headers)
+
+    except Exception as e:
+        return Response(content=f"Segment proxy encountered an error: {str(e)}", status_code=500)
 
 @app.api_route("/api/thumbnail", methods=["GET", "OPTIONS"])
 @app.api_route("/api/stream/thumbnail", methods=["GET", "OPTIONS"])
@@ -783,50 +1499,78 @@ async def stream_thumbnail(request: Request):
     url = request.query_params.get("url") or ""
     surl = request.query_params.get("surl") or ""
     fs_id = request.query_params.get("fs_id") or ""
-    size_type = request.query_params.get("size_type") or "url3"
+    size_type = request.query_params.get("size_type") or request.query_params.get("size") or "url3"
     sig = request.query_params.get("sig") or ""
     exp = request.query_params.get("exp") or ""
 
-    if not url and not (surl and fs_id): return Response(content="Missing thumbnail URL or surl/fs_id", status_code=400)
+    if not url and not (surl and fs_id):
+        return Response(content="Missing thumbnail URL or surl/fs_id parameters", status_code=400)
 
     if not url:
         if not (sig and verify_signature(surl, fs_id, size_type, sig, exp)) and not await check_auth(request):
             return Response(content="Unauthorized: Invalid signature or API key.", status_code=401)
         
         share_url = f"https://1024terabox.com/s/{surl}"
-        cached_res = cache.get(share_url, "l", False) or cache.get(share_url, "d", False)
+        cached_res = cache.get(share_url, "l", False)
         if not cached_res:
             try:
-                cached_res = await resolve_link_with_retry(share_url, action="d")
-                if cached_res.get("errno") == 0: cache.put(share_url, "d", False, cached_res)
-            except Exception as e: return Response(content=f"Failed to resolve thumbnail details: {str(e)}", status_code=500)
+                cached_res = await resolve_link_with_retry(share_url, action="l")
+                if cached_res.get("errno") == 0:
+                    cache.put(share_url, "l", False, cached_res)
+            except Exception as e:
+                return Response(content=f"Failed to resolve thumbnail details: {str(e)}", status_code=500)
 
-        if cached_res.get("errno") != 0: return Response(content="Failed to query share content.", status_code=400)
+        if cached_res.get("errno") != 0:
+            return Response(content="Failed to query share content.", status_code=400)
 
-        matching_file = next((f for f in cached_res.get("files", []) if str(f.get("original_fs_id")) == str(fs_id) or str(f.get("fs_id")) == str(fs_id)), None)
-        if not matching_file or not matching_file.get("thumbnails"): return Response(content="Thumbnail image not found", status_code=404)
+        matching_file = None
+        for f in cached_res.get("files", []):
+            if str(f.get("original_fs_id")) == str(fs_id) or str(f.get("fs_id")) == str(fs_id):
+                matching_file = f
+                break
+        
+        if not matching_file or not matching_file.get("thumbnails"):
+            return Response(content="Thumbnail image not found", status_code=404)
 
-        url = matching_file["thumbnails"].get(size_type) or next(iter(matching_file["thumbnails"].values()), None)
-        if not url: return Response(content="Thumbnail image not available", status_code=404)
+        url = matching_file["thumbnails"].get(size_type)
+        if not url:
+            url = next(iter(matching_file["thumbnails"].values()), None)
+
+        if not url:
+            return Response(content="Thumbnail image not available", status_code=404)
+
     else:
         if not (sig and verify_signature(url, "", "", sig, exp)) and not await check_auth(request):
             return Response(content="Unauthorized: Invalid signature or API key.", status_code=401)
 
+    client = _proxy_client
     try:
-        req_ctx = _proxy_client.stream("GET", url, headers={"User-Agent": UA}, cookies=COOKIES_DICT, timeout=30.0)
+        req_ctx = client.stream("GET", url, headers={"User-Agent": UA}, cookies=COOKIES_DICT, timeout=30.0)
         req = await req_ctx.__aenter__()
 
-        resp_headers = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS" }
+        resp_headers = {}
         for key in ("Content-Length", "Content-Type"):
-            if key in req.headers: resp_headers[key] = req.headers[key]
+            if key in req.headers:
+                resp_headers[key] = req.headers[key]
+
+        cors_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+        }
+        resp_headers.update(cors_headers)
 
         async def generate():
             try:
-                async for chunk in req.aiter_bytes(chunk_size=32768): yield chunk
-            finally: await req_ctx.__aexit__(None, None, None)
+                async for chunk in req.aiter_bytes(chunk_size=32768):
+                    yield chunk
+            finally:
+                await req_ctx.__aexit__(None, None, None)
 
         return StreamingResponse(generate(), status_code=req.status_code, headers=resp_headers)
-    except Exception as e: return Response(content=f"Thumbnail proxy encountered an error: {str(e)}", status_code=500)
+
+    except Exception as e:
+        return Response(content=f"Thumbnail proxy encountered an error: {str(e)}", status_code=500)
 
 @app.api_route("/api/download", methods=["GET", "OPTIONS"])
 async def download_file_route(request: Request):
@@ -835,7 +1579,8 @@ async def download_file_route(request: Request):
     sig = request.query_params.get("sig") or ""
     exp = request.query_params.get("exp") or ""
 
-    if not surl or not fs_id: return Response(content="Missing required parameters: surl and fs_id", status_code=400)
+    if not surl or not fs_id:
+        return Response(content="Missing required parameters: surl and fs_id", status_code=400)
 
     if not (sig and verify_signature(surl, fs_id, "", sig, exp)) and not await check_auth(request):
         return Response(content="Unauthorized: Invalid signature or API key.", status_code=401)
@@ -844,131 +1589,188 @@ async def download_file_route(request: Request):
     cached_res = cache.get(share_url, "d", False)
     if not cached_res:
         try:
-            raw_res = await resolve_link_with_retry(share_url, action="d")
-            if raw_res.get("errno") == 0:
-                cached_res, _ = _format_resolved_response(request, raw_res, share_url)
-                cache.put(share_url, "d", False, cached_res)
-        except Exception as e: return Response(content=f"Failed to resolve download details: {str(e)}", status_code=500)
+            cached_res = await resolve_link_with_retry(share_url, action="d")
+            if cached_res.get("errno") == 0:
+                is_transcoding = any(f.get("error") == "transcoding_in_progress" for f in cached_res.get("files", []))
+                if not is_transcoding:
+                    cache.put(share_url, "d", False, cached_res)
+        except Exception as e:
+            return Response(content=f"Failed to resolve download details: {str(e)}", status_code=500)
 
-    if not cached_res or cached_res.get("status") == "error": return Response(content="Failed to resolve share link", status_code=400)
+    if cached_res.get("errno") != 0:
+        return Response(content=f"Failed to resolve share link: {cached_res.get('error', 'Unknown error')}", status_code=400)
 
-    target_file = next((f for f in cached_res.get("files", []) if str(f.get("original_fs_id")) == str(fs_id) or str(f.get("fs_id")) == str(fs_id)), None)
-    if not target_file: return Response(content="File not found in share link", status_code=404)
+    target_file = None
+    for f in cached_res.get("files", []):
+        if str(f.get("original_fs_id")) == str(fs_id) or str(f.get("fs_id")) == str(fs_id):
+            target_file = f
+            break
 
-    # [FIX 4] Call actual terabox link. Prevents Infinite loops!
-    dlink = target_file.get("_real_dlink") or target_file.get("dlink")
-    
-    base_url = str(_request_base_url(request))
-    if not dlink or dlink.startswith(base_url):
-        return Response(content="Direct download link not available for this file", status_code=404)
+    if not target_file:
+        return Response(content="File not found in share link", status_code=404)
 
+    if target_file.get("error"):
+        return Response(content=f"File resolution error: {target_file.get('error')}", status_code=400)
+
+    dlink = target_file.get("dlink")
     filename = target_file.get("filename") or "download"
 
+    if not dlink:
+        return Response(content="Download link not available for this file", status_code=404)
+
+    client = _proxy_client
     try:
-        headers = { "User-Agent": UA, "Referer": "https://dm.1024terabox.com/" }
-        if request.headers.get("Range"): headers["Range"] = request.headers.get("Range")
+        headers = {
+            "User-Agent": UA,
+            "Referer": "https://dm.1024terabox.com/",
+        }
+        range_header = request.headers.get("Range")
+        if range_header:
+            headers["Range"] = range_header
 
-        req_ctx = _proxy_client.stream("GET", dlink, headers=headers, cookies=COOKIES_DICT, timeout=120.0)
+        req_ctx = client.stream("GET", dlink, headers=headers, cookies=COOKIES_DICT, timeout=120.0)
         req = await req_ctx.__aenter__()
-
-        # Handle CDN errors natively
-        if req.status_code >= 400:
-            err_msg = await req.aread()
-            await req_ctx.__aexit__(None, None, None)
-            return Response(content=f"Terabox Error ({req.status_code}): {err_msg.decode('utf-8', 'ignore')}", status_code=req.status_code)
 
         resp_headers = {}
         for key in ("Content-Length", "Content-Type", "Content-Range", "Accept-Ranges"):
-            if key in req.headers: resp_headers[key] = req.headers[key]
+            if key in req.headers:
+                resp_headers[key] = req.headers[key]
+
+        if "Content-Type" not in resp_headers:
+            resp_headers["Content-Type"] = "application/octet-stream"
 
         quoted_filename = urllib.parse.quote(filename)
-        is_video = filename.lower().endswith(VIDEO_EXTS)
-
-        # [FIX 5] MP4 inline support for Web Player
-        if is_video:
-            resp_headers["Content-Type"] = "video/mp4"
-            resp_headers["Content-Disposition"] = f"inline; filename*=UTF-8''{quoted_filename}"
-        else:
-            if "Content-Type" not in resp_headers: resp_headers["Content-Type"] = "application/octet-stream"
-            resp_headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quoted_filename}"
+        resp_headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quoted_filename}"
 
         resp_headers.update({
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Headers": "Range, *",
+            "Access-Control-Allow-Headers": "*",
             "Access-Control-Allow-Methods": "GET, OPTIONS",
-            "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges"
         })
 
         async def generate():
             try:
-                async for chunk in req.aiter_bytes(chunk_size=524288): yield chunk
-            finally: await req_ctx.__aexit__(None, None, None)
+                async for chunk in req.aiter_bytes(chunk_size=524288):
+                    yield chunk
+            finally:
+                await req_ctx.__aexit__(None, None, None)
 
         return StreamingResponse(generate(), status_code=req.status_code, headers=resp_headers)
 
-    except Exception as e: return Response(content=f"Download proxy error: {str(e)}", status_code=500)
+    except Exception as e:
+        return Response(content=f"Download proxy encountered an error: {str(e)}", status_code=500)
 
 @app.get("/api/debug_curl")
 async def debug_curl(request: Request):
-    if not await check_admin(request): return Response(content="Unauthorized", status_code=401)
+    if not await check_admin(request):
+        return Response(content="Unauthorized", status_code=401)
     url = request.query_params.get("url")
-    if not url: return Response(content="Missing url", status_code=400)
+    if not url:
+        return Response(content="Missing url", status_code=400)
     try:
         import httpx
         async with httpx.AsyncClient(timeout=15.0, http2=True) as client:
             req = await client.get(url, headers={"User-Agent": UA}, cookies=COOKIES_DICT)
-            try: body = req.json()
-            except: body = req.text[:2000]
-            return { "status_code": req.status_code, "headers": dict(req.headers), "body": body }
-    except Exception as e: return Response(content=str(e), status_code=500)
+            try:
+                body = req.json()
+            except Exception:
+                body = req.text[:2000]
+            return {
+                "status_code": req.status_code,
+                "headers": dict(req.headers),
+                "body": body
+            }
+    except Exception as e:
+        return Response(content=str(e), status_code=500)
 
+# ─── Dynamic Config Sync ─────────────────────────────────────────────
 _current_active_account_id = None
 
 def load_config_from_redis():
     global _current_active_account_id
-    if not redis_client: return
+    if not redis_client:
+        return
     try:
         active_id = redis_client.get(ACTIVE_ACCOUNT_KEY)
-        if isinstance(active_id, bytes): active_id = active_id.decode("utf-8")
+        if isinstance(active_id, bytes):
+            active_id = active_id.decode("utf-8")
         creds = None
+        
         if active_id:
             raw_creds = redis_client.hget(ACCOUNTS_HASH_KEY, active_id)
             if raw_creds:
-                try: creds = json.loads(raw_creds)
-                except Exception: pass
+                try:
+                    creds = json.loads(raw_creds)
+                except Exception:
+                    pass
+                    
         if not creds or creds.get("status") != "healthy":
             active_id, creds = get_next_healthy_account()
+            
         if creds:
             _current_active_account_id = active_id
             from downloader import update_credentials
-            update_credentials(cookie=creds.get("cookie"), js_token=creds.get("js_token"), bds_token=creds.get("bds_token"), logid=creds.get("logid"))
-    except Exception as e: print(f"[TeraBridge][WARN] Failed to load config from Upstash Redis pool: {e}", flush=True)
+            update_credentials(
+                cookie=creds.get("cookie"),
+                js_token=creds.get("js_token"),
+                bds_token=creds.get("bds_token"),
+                logid=creds.get("logid")
+            )
+            print(f"[TeraBridge] Successfully synchronized active pool account: {active_id}", flush=True)
+    except Exception as e:
+        print(f"[TeraBridge][WARN] Failed to load config from Upstash Redis pool: {e}", flush=True)
 
+# Load initial config on startup
 load_config_from_redis()
 
 @app.api_route("/api/admin/config", methods=["GET", "POST"])
 async def admin_config(request: Request):
-    if not await check_admin(request): return JSONResponse({"status": "error", "message": "Unauthorized: Admin API key required."}, status_code=401)
-    if not redis_client: return JSONResponse({"status": "error", "message": "Redis client is not configured."}, status_code=400)
+    if not await check_admin(request):
+        return JSONResponse({"status": "error", "message": "Unauthorized: Admin API key required."}, status_code=401)
+
+    if not redis_client:
+        return JSONResponse({
+            "status": "error",
+            "message": "Redis client is not configured. Config cannot be updated dynamically."
+        }, status_code=400)
 
     if request.method == "POST":
-        try: data = await request.json()
-        except: data = {}
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        
         account_id = data.get("account_id") or _current_active_account_id or "account_1"
+        
+        # Support adding just the ndus token — auto-construct the full cookie
         ndus_value = data.get("ndus")
-        if ndus_value and not data.get("cookie"): data["cookie"] = f"ndus={ndus_value}; PANWEB=1"
+        if ndus_value and not data.get("cookie"):
+            data["cookie"] = f"ndus={ndus_value}; PANWEB=1"
+        
         cookie_value = data.get("cookie")
         
         if not cookie_value:
+            # Check if there are other valid updates (for existing accounts)
             valid_keys = {"cookie", "js_token", "bds_token", "logid"}
             updates = {k: v for k, v in data.items() if k in valid_keys and v is not None}
-            if not updates: return JSONResponse({"status": "error", "message": "No valid configuration updates provided."}, status_code=400)
+            if not updates:
+                return JSONResponse({
+                    "status": "error",
+                    "message": "No valid configuration updates provided. Provide at least 'ndus' or 'cookie'."
+                }, status_code=400)
         else:
+            # Validate session and resolve tokens in a single request to Terabox
             try:
                 resolved_tokens = await resolve_tokens_from_cookie(cookie_value)
+                # Merge resolved tokens (don't override if user explicitly provided them)
                 for key in ("bds_token", "js_token", "logid"):
-                    if resolved_tokens.get(key) and not data.get(key): data[key] = resolved_tokens[key]
-            except Exception as e: return JSONResponse({"status": "error", "message": f"Cookie validation failed: {str(e)}"}, status_code=400)
+                    if resolved_tokens.get(key) and not data.get(key):
+                        data[key] = resolved_tokens[key]
+            except Exception as e:
+                return JSONResponse({
+                    "status": "error",
+                    "message": f"Cookie validation or token resolution failed: {str(e)}"
+                }, status_code=400)
         
         valid_keys = {"cookie", "js_token", "bds_token", "logid"}
         updates = {k: v for k, v in data.items() if k in valid_keys and v is not None}
@@ -977,32 +1779,59 @@ async def admin_config(request: Request):
             existing_raw = redis_client.hget(ACCOUNTS_HASH_KEY, account_id)
             account_data = {}
             if existing_raw:
-                try: account_data = json.loads(existing_raw)
-                except: pass
+                try:
+                    account_data = json.loads(existing_raw)
+                except Exception:
+                    pass
+            
             account_data.update(updates)
             account_data["status"] = "healthy"
             account_data["last_used"] = account_data.get("last_used") or int(time.time())
-            for legacy_key in ("unhealthy_reason", "unhealthy_at", "sign", "timestamp"): account_data.pop(legacy_key, None)
+            if "unhealthy_reason" in account_data:
+                del account_data["unhealthy_reason"]
+            if "unhealthy_at" in account_data:
+                del account_data["unhealthy_at"]
+            # Clean up legacy fields that are no longer used
+            for legacy_key in ("sign", "timestamp"):
+                account_data.pop(legacy_key, None)
 
             redis_client.hset(ACCOUNTS_HASH_KEY, account_id, json.dumps(account_data))
             
             active_id = redis_client.get(ACTIVE_ACCOUNT_KEY)
-            if isinstance(active_id, bytes): active_id = active_id.decode("utf-8")
+            if isinstance(active_id, bytes):
+                active_id = active_id.decode("utf-8")
             if active_id == account_id or not active_id:
                 redis_client.set(ACTIVE_ACCOUNT_KEY, account_id)
                 load_config_from_redis()
-            return {"status": "success", "message": f"Account '{account_id}' updated.", "updated_keys": list(updates.keys())}
-        except Exception as e: return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+                
+            return {
+                "status": "success",
+                "message": f"Account '{account_id}' updated successfully in Redis pool.",
+                "updated_keys": list(updates.keys()),
+                "auto_resolved": [k for k in ("bds_token", "js_token", "logid") if k in updates and k not in (data.get("_user_provided_keys") or [])]
+            }
+        except Exception as e:
+            return JSONResponse({
+                "status": "error",
+                "message": f"Failed to update config in Redis pool: {str(e)}"
+            }, status_code=500)
 
     else:
         try:
             active_id = redis_client.get(ACTIVE_ACCOUNT_KEY)
-            if isinstance(active_id, bytes): active_id = active_id.decode("utf-8")
+            if isinstance(active_id, bytes):
+                active_id = active_id.decode("utf-8")
             raw_accounts = redis_client.hgetall(ACCOUNTS_HASH_KEY) or {}
+            
             def mask_val(key, val):
-                if not val: return None
-                if key == "cookie": return f"{val[:15]}...{val[-15:]}" if len(val) > 30 else "set"
-                if len(val) > 8: return f"{val[:4]}...{val[-4:]}"
+                if not val:
+                    return None
+                if key == "cookie":
+                    if len(val) > 30:
+                        return f"{val[:15]}...{val[-15:]}"
+                    return "set"
+                if len(val) > 8:
+                    return f"{val[:4]}...{val[-4:]}"
                 return "set"
 
             pool_summary = {}
@@ -1011,36 +1840,71 @@ async def admin_config(request: Request):
                     acc_data = json.loads(raw_val)
                     masked = {k: mask_val(k, v) if k in ("cookie", "js_token", "bds_token", "logid") else v for k, v in acc_data.items()}
                     pool_summary[acc_id.decode("utf-8") if isinstance(acc_id, bytes) else acc_id] = masked
-                except: pass
+                except Exception:
+                    pass
 
-            return {"status": "success", "active_account_id": active_id, "accounts_pool": pool_summary}
-        except Exception as e: return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+            return {
+                "status": "success",
+                "active_account_id": active_id,
+                "accounts_pool": pool_summary
+            }
+        except Exception as e:
+            return JSONResponse({
+                "status": "error",
+                "message": f"Failed to read accounts from Redis pool: {str(e)}"
+            }, status_code=500)
 
+# ─── Cron Session Validation & Webhook Alerts ───────────────────────
 async def send_webhook_alert(message):
-    if not NOTIFICATION_WEBHOOK_URL: return
+    if not NOTIFICATION_WEBHOOK_URL:
+        return
     import datetime
     import httpx
     
     payload = {}
     if "discord.com" in NOTIFICATION_WEBHOOK_URL:
-        payload = {"embeds": [{"title": "🚨 TeraBridge API Warning", "description": message, "color": 16711680, "timestamp": datetime.datetime.utcnow().isoformat()}]}
-    elif "slack.com" in NOTIFICATION_WEBHOOK_URL: payload = {"text": f"🚨 *TeraBridge API Warning:*\n{message}"}
-    else: payload = {"event": "session_expired", "message": message}
+        payload = {
+            "embeds": [{
+                "title": "🚨 TeraBridge API Warning",
+                "description": message,
+                "color": 16711680,
+                "timestamp": datetime.datetime.utcnow().isoformat()
+            }]
+        }
+    elif "slack.com" in NOTIFICATION_WEBHOOK_URL:
+        payload = {
+            "text": f"🚨 *TeraBridge API Warning:*\n{message}"
+        }
+    else:
+        payload = {
+            "event": "session_expired",
+            "message": message
+        }
 
     try:
-        async with httpx.AsyncClient() as client: await client.post(NOTIFICATION_WEBHOOK_URL, json=payload, timeout=10.0)
-    except: pass
+        async with httpx.AsyncClient() as client:
+            await client.post(NOTIFICATION_WEBHOOK_URL, json=payload, timeout=10.0)
+    except Exception as e:
+        print(f"[TeraBridge][WARN] Failed to send webhook alert: {e}", flush=True)
 
 @app.api_route("/api/cron/validate", methods=["GET", "POST"])
 async def cron_validate(request: Request):
     client_secret = request.query_params.get("secret")
     if not client_secret and "application/json" in request.headers.get("content-type", ""):
-        try: body = await request.json(); client_secret = body.get("secret")
-        except: pass
+        try:
+            body = await request.json()
+            client_secret = body.get("secret")
+        except Exception:
+            pass
 
     is_master = await check_admin(request)
-    is_cron_ok = bool(CRON_SECRET and client_secret and hmac.compare_digest(str(client_secret), str(CRON_SECRET)))
-    if not (is_master or is_cron_ok): return JSONResponse({"status": "error", "message": "Unauthorized."}, status_code=401)
+    is_cron_ok = bool(
+        CRON_SECRET
+        and client_secret
+        and hmac.compare_digest(str(client_secret), str(CRON_SECRET))
+    )
+    if not (is_master or is_cron_ok):
+        return JSONResponse({"status": "error", "message": "Unauthorized: Invalid or missing cron secret or admin key."}, status_code=401)
 
     accounts_checked = 0
     accounts_invalidated = []
@@ -1051,6 +1915,8 @@ async def cron_validate(request: Request):
             for acc_id, raw_val in raw_accounts.items():
                 acc_id_str = acc_id.decode("utf-8") if isinstance(acc_id, bytes) else acc_id
                 creds = json.loads(raw_val)
+                
+                # We only check healthy accounts (no need to repeatedly check already unhealthy ones)
                 if creds.get("status", "healthy") == "healthy":
                     cookie_val = creds.get("cookie")
                     if cookie_val:
@@ -1059,36 +1925,66 @@ async def cron_validate(request: Request):
                         if not is_valid:
                             mark_account_unhealthy(acc_id_str, reason=msg)
                             accounts_invalidated.append((acc_id_str, msg))
-                            await send_webhook_alert(f"🚨 **TeraBox Account Expired!**\nAccount ID: `{acc_id_str}`\nReason: `{msg}`")
                             
+                            # Alert on Slack/Discord webhook
+                            alert_msg = (
+                                f"🚨 **TeraBox Account Expired!**\n"
+                                f"Account ID: `{acc_id_str}`\n"
+                                f"Reason: `{msg}`\n\n"
+                                f"Please refresh its cookie and update it at `/api/admin/config` immediately."
+                            )
+                            await send_webhook_alert(alert_msg)
+                            
+            # If the current active account got invalidated, force rotate immediately
             active_id = redis_client.get(ACTIVE_ACCOUNT_KEY)
-            if isinstance(active_id, bytes): active_id = active_id.decode("utf-8")
+            if isinstance(active_id, bytes):
+                active_id = active_id.decode("utf-8")
             if active_id and any(item[0] == active_id for item in accounts_invalidated):
                 get_next_healthy_account()
                 load_config_from_redis()
-        except: pass
+                
+        except Exception as e:
+            print(f"[TeraBridge][WARN] Failed to run cron accounts check: {e}", flush=True)
+            
     else:
+        # Fallback to local default cookie if Redis is not configured
         from downloader import COOKIE
         if COOKIE:
             accounts_checked += 1
             is_valid, msg = await validate_session_cookie(COOKIE)
             if not is_valid:
                 accounts_invalidated.append(("default_env", msg))
-                await send_webhook_alert(f"🚨 **Default Env Cookie Expired!**\nReason: `{msg}`")
+                alert_msg = f"🚨 **Default Env Cookie Expired!**\nReason: `{msg}`"
+                await send_webhook_alert(alert_msg)
 
+    # Write summary status to Redis status hash
     status_data = {
-        "last_checked": str(int(time.time())), "checked_count": str(accounts_checked),
-        "invalidated_count": str(len(accounts_invalidated)), "status": "healthy" if len(accounts_invalidated) == 0 else "degraded"
+        "last_checked": str(int(time.time())),
+        "checked_count": str(accounts_checked),
+        "invalidated_count": str(len(accounts_invalidated)),
+        "status": "healthy" if len(accounts_invalidated) == 0 else "degraded"
     }
     
     if redis_client:
-        try: redis_client.hset("terabridge:status", values=status_data)
-        except: pass
+        try:
+            redis_client.hset("terabridge:status", values=status_data)
+        except Exception as e:
+            print(f"[TeraBridge][WARN] Failed to write status to Redis in cron: {e}", flush=True)
 
-    return {"status": "success", "checked_count": accounts_checked, "invalidated_count": len(accounts_invalidated), "invalidated_accounts": [acc[0] for acc in accounts_invalidated]}
+    return {
+        "status": "success",
+        "checked_count": accounts_checked,
+        "invalidated_count": len(accounts_invalidated),
+        "invalidated_accounts": [acc[0] for acc in accounts_invalidated]
+    }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 5000))
     print(f"[TeraBridge] Cache TTL: {CACHE_TTL_SECONDS}s | Rate limit: {RATE_LIMIT_RPM} req/min")
+    if not API_KEY and not REQUIRE_API_KEY:
+        print("[TeraBridge][WARNING] API_KEY is not set and REQUIRE_API_KEY is disabled — "
+              "all endpoints are currently OPEN (no authentication). Do not expose this "
+              "instance to the public internet.", flush=True)
+    print(f"[TeraBridge] Starting Uvicorn async server on 0.0.0.0:{port}")
     uvicorn.run("api.index:app", host="0.0.0.0", port=port, reload=False, workers=1)
