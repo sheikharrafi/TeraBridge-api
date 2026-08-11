@@ -29,6 +29,8 @@ COOKIE   = os.environ.get("TERABOX_COOKIE", "")
 
 UA = "dubox;P2SP;2.2.91.249;dubox;4.2.0.1;I2404;android-android;16;JSbridge1.0.10;jointbridge;1.1.39;"
 ROOT_PATH = "/cloudvids"
+
+# index.py এর ইমপোর্ট এরর ঠিক করার জন্য গ্লোবাল ভেরিয়েবলটি এখানে যুক্ত করা হলো
 VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.wmv', '.m4v', '.3gp', '.mpg', '.mpeg', '.ts', '.m3u8')
 
 def parse_cookies(cookie_str):
@@ -208,7 +210,6 @@ async def _process_file_metadata(item, share_id, uk, share_session, bdstoken_val
         file_res["error"] = "File is a directory"
         return file_res
 
-    # সরাসরি ট্রান্সফার (কোনো ১০০০ ফাইল চেকিংয়ের স্লো লজিক নেই)
     transfer_res = await transfer_shared_file(fs_id, share_id, uk, share_session, bdstoken_val)
     
     if transfer_res.get("errno") not in (0, 4, 12):
@@ -263,7 +264,6 @@ async def _resolve_link(link):
     for item in files_list:
         results.append(await _process_file_metadata(item, share_data.get("share_id"), share_data.get("uk"), share_session, BDSTOKEN))
 
-    # ফাস্ট ব্যাচ ফাইলমেটা কল (dlink এবং thumbnails সহ)
     fs_ids_to_resolve = [r["fs_id"] for r in results if r.get("fs_id") and not r.get("error")]
     if fs_ids_to_resolve:
         encoded_fsids = urllib.parse.quote(json.dumps(fs_ids_to_resolve))
@@ -292,10 +292,6 @@ async def _resolve_link(link):
         "files": results
     }
 
-async def close_session():
-    global _session
-    if _session is not None and not _session.is_closed:
-        await _session.aclose()
 async def validate_session_cookie(cookie_str):
     temp_cookies = parse_cookies(cookie_str)
     try:
@@ -326,3 +322,8 @@ async def resolve_tokens_from_cookie(cookie_str):
             return resolved
     except Exception as e:
         raise Exception(f"Failed to resolve tokens: {str(e)}")
+
+async def close_session():
+    global _session
+    if _session is not None and not _session.is_closed:
+        await _session.aclose()
