@@ -1618,13 +1618,6 @@ async def download_file_route(request: Request):
     if not dlink:
         return Response(content="Download link not available for this file", status_code=404)
 
-    # Fast path: hand the browser straight to Terabox's CDN instead of
-    # streaming every byte through this server. Cuts a full extra hop,
-    # removes our egress/CPU as the bottleneck, and lets the client's own
-    # connection speed determine download/playback speed.
-    if REDIRECT_SEGMENTS:
-        return RedirectResponse(url=dlink, status_code=307)
-
     client = _proxy_client
     try:
         headers = {
