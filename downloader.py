@@ -29,6 +29,7 @@ COOKIE   = os.environ.get("TERABOX_COOKIE", "")
 
 UA = "dubox;P2SP;2.2.91.249;dubox;4.2.0.1;I2404;android-android;16;JSbridge1.0.10;jointbridge;1.1.39;"
 ROOT_PATH = "/cloudvids"
+VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.wmv', '.m4v', '.3gp', '.mpg', '.mpeg', '.ts', '.m3u8')
 
 def parse_cookies(cookie_str):
     cookies = {}
@@ -295,3 +296,33 @@ async def close_session():
     global _session
     if _session is not None and not _session.is_closed:
         await _session.aclose()
+async def validate_session_cookie(cookie_str):
+    temp_cookies = parse_cookies(cookie_str)
+    try:
+        async with httpx.AsyncClient(headers=HEADERS, cookies=temp_cookies, timeout=15.0, follow_redirects=True) as temp_client:
+            r = await temp_client.get(f"{BASE_API}/main")
+            if r.status_code != 200:
+                return False, f"HTTP status {r.status_code}"
+            m = re.findall(r'bdstoken["\']?\s*[:=]\s*["\']([a-f0-9]{32})["\']', r.text, re.IGNORECASE)
+            if m:
+                return True, "Valid"
+            return False, "bdstoken not found"
+    except Exception as e:
+        return False, f"Request failed: {str(e)}"
+
+async def resolve_tokens_from_cookie(cookie_str):
+    temp_cookies = parse_cookies(cookie_str)
+    resolved = {}
+    try:
+        async with httpx.AsyncClient(headers=HEADERS, cookies=temp_cookies, timeout=15.0, follow_redirects=True) as temp_client:
+            r = await temp_client.get(f"{BASE_API}/main")
+            if r.status_code != 200:
+                raise Exception(f"TeraBox returned HTTP {r.status_code}")
+            m1 = re.findall(r'bdstoken["\']?\s*[:=]\s*["\']([a-f0-9]{32})["\']', r.text, re.IGNORECASE)
+            if m1:
+                resolved["bds_token"] = m1[0]
+            if not resolved.get("bds_token"):
+                raise Exception("bdstoken not found")
+            return resolved
+    except Exception as e:
+        raise Exception(f"Failed to resolve tokens: {str(e)}")
