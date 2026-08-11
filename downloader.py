@@ -23,8 +23,6 @@ if sys.version_info >= (3, 7):
 BASE_PUBLIC = "https://www.terabox.com"
 BASE_API    = "https://dm.1024terabox.com"
 
-# Credentials must be supplied via the environment or account pool.  TeraBox
-# binds tokens to a session, so source-code fallbacks are both unsafe and stale.
 JSTOKEN  = os.environ.get("TERABOX_JSTOKEN", "")
 BDSTOKEN = os.environ.get("TERABOX_BDSTOKEN", "")
 LOGID    = os.environ.get("TERABOX_LOGID", "")
@@ -44,13 +42,11 @@ def parse_cookies(cookie_str):
     return cookies
 
 def update_credentials(cookie=None, js_token=None, bds_token=None, logid=None):
-    """Dynamically update Terabox global cookies and tokens in the session."""
     global COOKIE, COOKIES_DICT, JSTOKEN, BDSTOKEN, LOGID
     if cookie:
         COOKIE = cookie
         COOKIES_DICT.clear()
         COOKIES_DICT.update(parse_cookies(cookie))
-        # Clear existing cookies in session and update with new ones
         client = get_session()
         client.cookies.clear()
         for k, v in COOKIES_DICT.items():
@@ -63,16 +59,14 @@ def update_credentials(cookie=None, js_token=None, bds_token=None, logid=None):
         LOGID = logid
 
 async def validate_session_cookie(cookie_str):
-    """Verify if a TeraBox cookie is valid by making a test request and checking for a bdstoken."""
     temp_cookies = parse_cookies(cookie_str)
-    
     try:
-        async with httpx.AsyncClient(headers=HEADERS, cookies=temp_cookies, timeout=15.0) as temp_client:
+        # Added follow_redirects=True here to fix the 302 error
+        async with httpx.AsyncClient(headers=HEADERS, cookies=temp_cookies, timeout=15.0, follow_redirects=True) as temp_client:
             r = await temp_client.get(f"{BASE_API}/main")
             if r.status_code != 200:
                 return False, f"HTTP status {r.status_code}"
             
-            # Look for bdstoken in the response HTML to verify successful session
             m = re.findall(r'bdstoken["\']?\s*[:=]\s*["\']([a-f0-9]{32})["\']', r.text, re.IGNORECASE)
             if m:
                 return True, "Valid"
@@ -81,21 +75,15 @@ async def validate_session_cookie(cookie_str):
         return False, f"Request failed: {str(e)}"
 
 async def resolve_tokens_from_cookie(cookie_str):
-    """
-    Given a TeraBox cookie string, hit the /main page and auto-scrape
-    bds_token, js_token, and logid from the response.
-    Returns a dict with the resolved tokens, or raises an exception on failure.
-    """
     temp_cookies = parse_cookies(cookie_str)
     resolved = {}
-    
     try:
-        async with httpx.AsyncClient(headers=HEADERS, cookies=temp_cookies, timeout=15.0) as temp_client:
+        # Added follow_redirects=True here to fix the 302 error
+        async with httpx.AsyncClient(headers=HEADERS, cookies=temp_cookies, timeout=15.0, follow_redirects=True) as temp_client:
             r = await temp_client.get(f"{BASE_API}/main")
             if r.status_code != 200:
                 raise Exception(f"TeraBox returned HTTP {r.status_code}")
             
-            # Scrape bdstoken
             m1 = re.findall(r'bdstoken["\']?\s*[:=]\s*["\']([a-f0-9]{32})["\']', r.text, re.IGNORECASE)
             if m1:
                 resolved["bds_token"] = m1[0]
@@ -104,7 +92,6 @@ async def resolve_tokens_from_cookie(cookie_str):
                 if m2:
                     resolved["bds_token"] = m2.group(1)
             
-            # Scrape jstoken
             m3 = re.findall(r'jstoken["\']?\s*[:=]\s*["\'](.*?)["\']', r.text, re.IGNORECASE)
             if m3:
                 decoded_js = urllib.parse.unquote(m3[0])
@@ -112,7 +99,6 @@ async def resolve_tokens_from_cookie(cookie_str):
                 if arg_match:
                     resolved["js_token"] = arg_match.group(1)
             
-            # Extract logid from response cookies if available
             for cookie_name, cookie_val in r.cookies.items():
                 if cookie_name.lower() == "logid":
                     resolved["logid"] = cookie_val
@@ -121,7 +107,6 @@ async def resolve_tokens_from_cookie(cookie_str):
             if not resolved.get("bds_token"):
                 raise Exception("bdstoken not found — cookie is likely expired or invalid")
             
-            print(f"[TeraBridge] Auto-resolved tokens: {list(resolved.keys())}", flush=True)
             return resolved
     except Exception as e:
         raise Exception(f"Failed to resolve tokens from cookie: {str(e)}")
@@ -139,24 +124,19 @@ HEADERS = {
 def qp():
     return f"app_id=250528&web=1&channel=dubox&clienttype=0&jsToken={JSTOKEN}&dp-logid={LOGID}"
 
-
 def _new_logid():
-    """Create a request id tied to the current account session."""
     seed = f"{int(time.time() * 1000)}{COOKIES_DICT.get('ndus', '')[:8]}"
     return hashlib.md5(seed.encode()).hexdigest().upper()
 
-
 async def refresh_account_tokens():
-    """Refresh account tokens from the authenticated main page."""
     global JSTOKEN, BDSTOKEN, LOGID
-
     browser_headers = {
         **HEADERS,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Referer": f"{BASE_API}/",
     }
-    response = await get_session().get(f"{BASE_API}/main", headers=browser_headers, timeout=20.0)
+    # Added follow_redirects=True to ensure the request follows the 302 redirect
+    response = await get_session().get(f"{BASE_API}/main", headers=browser_headers, timeout=20.0, follow_redirects=True)
     response.raise_for_status()
     html = response.text
 
@@ -172,9 +152,7 @@ async def refresh_account_tokens():
         JSTOKEN = token_match.group(1) if token_match else decoded
     LOGID = _new_logid()
 
-
 async def resolve_share_session(surl, link):
-    """Get the share token required by ``/share/transfer``."""
     share_url = link if "://" in link else f"https://{link}"
     parsed = urllib.parse.urlparse(share_url)
     bases = [f"{parsed.scheme or 'https'}://{parsed.netloc}", BASE_PUBLIC, BASE_API]
@@ -219,9 +197,7 @@ async def resolve_share_session(surl, link):
                 return data
     return {}
 
-
 async def wait_for_transfer(task_id, bdstoken_val):
-    """Wait until TeraBox confirms an asynchronous share copy completed."""
     for _ in range(60):
         response = await get_session().get(
             f"{BASE_API}/share/taskquery",
@@ -241,9 +217,7 @@ async def wait_for_transfer(task_id, bdstoken_val):
         await asyncio.sleep(2)
     return {"errno": -1, "errmsg": "Timed out waiting for TeraBox transfer"}
 
-
 async def transfer_shared_file(fs_id, share_id, uk, share_session, bdstoken_val):
-    """Copy one shared file using the share-session-aware transfer contract."""
     sekey = urllib.parse.unquote(share_session.get("randsk", ""))
     profiles = [
         ("12", "terabox;1.40.0.132;PC;PC-Windows;10.0.26100;WindowsTeraBox"),
@@ -289,45 +263,39 @@ async def transfer_shared_file(fs_id, share_id, uk, share_session, bdstoken_val)
     return last_result
 
 def _create_session():
-    """Create an httpx.AsyncClient with connection pooling."""
     pool_conn = int(os.environ.get("HTTP_POOL_CONNECTIONS", 50))
     pool_max = int(os.environ.get("HTTP_POOL_MAXSIZE", 100))
     limits = httpx.Limits(max_keepalive_connections=pool_conn, max_connections=pool_max)
-    
     s = httpx.AsyncClient(
         headers=HEADERS,
         cookies=COOKIES_DICT,
         limits=limits,
         timeout=httpx.Timeout(30.0),
-        http2=True
+        http2=True,
+        follow_redirects=True  # Added this line to fix the 302 issue globally!
     )
     return s
 
 _session = None
 
 def get_session():
-    """Return the live shared client, recreating it after app shutdown/tests."""
     global _session
     if _session is None or _session.is_closed:
         _session = _create_session()
     return _session
 
 async def close_session():
-    """Close the current client without leaving a permanently closed global."""
     global _session
     if _session is not None and not _session.is_closed:
         await _session.aclose()
 
-_SURL_MIN_LEN = 8     # empirical floor; real Terabox surls are 22-23 chars
-_LEADING_ONE_MAX_STRIPS = 4  # never strip more than this many leading '1' chars
+_SURL_MIN_LEN = 8
+_LEADING_ONE_MAX_STRIPS = 4
 _VALID_SURL = re.compile(r"^[A-Za-z0-9_-]+$")
 
-
 def parse_surl(url):
-    """Extract and clean the shorturl key (`surl`) from a Terabox share link."""
     if not isinstance(url, str) or not url:
         raise ValueError("parse_surl: empty or non-string input")
-
     surl = None
     if "surl=" in url:
         after = url.split("surl=", 1)[1]
@@ -343,42 +311,21 @@ def parse_surl(url):
             raise ValueError(f"parse_surl: malformed input {url!r}")
         if _VALID_SURL.match(stripped) and len(stripped) >= _SURL_MIN_LEN:
             surl = stripped
-
     if not surl:
         raise ValueError(f"parse_surl: no surl found in {url!r}")
-
     surl = surl.rstrip("/").split("/")[-1]
-
     if not _VALID_SURL.match(surl):
         raise ValueError(f"parse_surl: extracted value {surl!r} contains invalid characters")
-
     if len(surl) > 22 and surl.startswith("1"):
         for _ in range(_LEADING_ONE_MAX_STRIPS):
             if not surl.startswith("1") or len(surl) - 1 < _SURL_MIN_LEN or len(surl) <= 22:
                 break
             surl = surl[1:]
-
     if len(surl) < _SURL_MIN_LEN:
         raise ValueError(f"parse_surl: cleaned surl {surl!r} is shorter than the {_SURL_MIN_LEN}-char minimum")
-
     return surl
 
-def show(label, r):
-    print(f"\n── {label} ──")
-    print(f"  Status: {r.status_code}")
-    try:
-        d = r.json()
-        print(f"  {json.dumps(d, indent=2)[:800]}")
-        return d
-    except:
-        print(f"  {r.text[:400]}")
-        return {}
-
 async def _process_single_file_metadata(item, share_id, uk, share_session, existing_files, action, wait_for_transcoding, bdstoken_val, quality=None):
-    """
-    Processes a single file from the shared link (transfer + streaming checks).
-    This function is run asynchronously.
-    """
     filename = item.get("server_filename")
     fs_id = item.get("fs_id")
     size_bytes = int(item.get("size", 0))
@@ -407,26 +354,21 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
     if action == "l":
         return file_res
 
-    # Check if the file already exists with same name and size
     my_fs_id = ""
     my_file_path = ""
+    
     if filename in existing_files and existing_files[filename]["size"] == size_bytes:
         my_fs_id = existing_files[filename]["fs_id"]
         my_file_path = existing_files[filename]["path"]
-        # File exists, skip transfer step
     else:
-        # Step A: Transfer
         try:
-            transfer_res = await transfer_shared_file(
-                fs_id, share_id, uk, share_session, bdstoken_val
-            )
+            transfer_res = await transfer_shared_file(fs_id, share_id, uk, share_session, bdstoken_val)
         except Exception as e:
             file_res["error"] = f"Transfer API request failed: {e}"
             file_res["transfer_status"] = "failed"
             return file_res
 
         if transfer_res.get("errno") == 2:
-            # Target directory ROOT_PATH likely does not exist. Auto-create it and retry.
             create_url = f"{BASE_API}/api/create?{qp()}&bdstoken={bdstoken_val}"
             create_payload = {
                 "path": ROOT_PATH,
@@ -438,13 +380,10 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
             try:
                 cr = await get_session().post(create_url, data=create_payload)
                 cr_res = cr.json()
-                if cr_res.get("errno") in (0, -8): # 0 = created, -8 = already exists
-                    # Retry transfer
-                    transfer_res = await transfer_shared_file(
-                        fs_id, share_id, uk, share_session, BDSTOKEN
-                    )
+                if cr_res.get("errno") in (0, -8):
+                    transfer_res = await transfer_shared_file(fs_id, share_id, uk, share_session, BDSTOKEN)
             except Exception as e:
-                print(f"[TeraBridge][WARN] Failed to auto-create directory: {e}", flush=True)
+                pass
 
         if transfer_res.get("errno") not in (0, 4):
             file_res["error"] = f"Transfer failed with Terabox errno {transfer_res.get('errno')}"
@@ -453,7 +392,6 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
 
         file_res["transfer_status"] = "success"
 
-        # Step B: Resolve my fs_id
         try:
             extra_list = transfer_res.get("extra", {}).get("list", [])
             if extra_list:
@@ -467,7 +405,6 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
             pass
 
         if not my_fs_id:
-            # Fallback search
             encoded_dir = urllib.parse.quote(ROOT_PATH)
             try:
                 r_list = await get_session().get(
@@ -492,7 +429,6 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
     file_res["filename"] = filename
     file_res["path"] = my_file_path
     
-    # --- ACTION HLS STREAMING ---
     is_video = bool(filename and filename.lower().endswith(VIDEO_EXTS))
 
     if action == "s" and is_video:
@@ -500,14 +436,12 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
             my_file_path = ROOT_PATH.rstrip("/") + "/" + filename
         encoded_path = urllib.parse.quote(my_file_path)
         
-        # Try multiple stream quality types — highest first
         if quality:
             stream_types = [quality]
         else:
             stream_types = ["M3U8_AUTO_1080", "M3U8_AUTO_720", "M3U8_AUTO_480", "M3U8_AUTO_360"]
         
         async def _try_stream(stype):
-            """Try a single streaming request. Returns (success, errno, response_text)."""
             res_val = "1080p" if "1080" in stype else ("720p" if "720" in stype else ("480p" if "480" in stype else "360p"))
             url = (
                 f"{BASE_API}/api/streaming?{qp()}&path={encoded_path}&type={stype}"
@@ -527,7 +461,6 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
             except Exception as e:
                 return False, -1, str(e)
         
-        # PASS 1: Quick scan — try each resolution once to find any that's ready
         best_m3u8 = None
         all_transcoding = True
         fatal_error = None
@@ -539,10 +472,8 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
                 all_transcoding = False
                 break
             elif errno == 130:
-                # Transcoding in progress — try next (lower) resolution
                 continue
             elif errno in (31066,):
-                # File format not supported for streaming at all
                 fatal_error = f"File format not supported for streaming (errno {errno})"
                 all_transcoding = False
                 break
@@ -551,7 +482,6 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
                 all_transcoding = False
                 break
             else:
-                # Unknown error on this type, try next
                 all_transcoding = False
                 file_res["error"] = f"Streaming API errno {errno}: {text}"
                 continue
@@ -563,13 +493,10 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
         elif fatal_error:
             file_res["error"] = fatal_error
         elif all_transcoding and wait_for_transcoding:
-            # PASS 2: All resolutions are still transcoding — wait and retry
             max_retries = 12
             retry_delay = 10
-            print(f"  ⏳ All resolutions still transcoding, waiting (up to {max_retries * retry_delay}s)...")
             for attempt in range(1, max_retries + 1):
                 await asyncio.sleep(retry_delay)
-                # Retry all types each round (highest first)
                 for stype in stream_types:
                     ok, errno, text = await _try_stream(stype)
                     if ok:
@@ -588,22 +515,13 @@ async def _process_single_file_metadata(item, share_id, uk, share_session, exist
 
 _resolve_lock = asyncio.Lock()
 
-
 async def resolve_link(link, action="d", wait_for_transcoding=False, quality=None):
-    """Serialize account-bound work while credentials live in one session."""
     async with _resolve_lock:
         return await _resolve_link(link, action, wait_for_transcoding, quality)
 
-
 async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=None):
-    """
-    Exposes the core resolution logic.
-    Returns a dict with metadata, transfer status, direct links, or streaming playlists.
-    """
     global BDSTOKEN, JSTOKEN
     
-    # Tokens are session-bound, so always refresh them instead of trusting
-    # bundled defaults left over from an earlier browser session.
     try:
         await refresh_account_tokens()
     except Exception as e:
@@ -613,6 +531,7 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
         surl = parse_surl(link)
     except ValueError as e:
         return {"errno": -3, "error": f"Invalid share link: {e}"}
+        
     list_url = (
         f"{BASE_PUBLIC}/share/list"
         f"?app_id=250528&shorturl={surl}&root=1&order=name&desc=0&showempty=0&web=1&page=1&num=100"
@@ -636,11 +555,8 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
     uk = share_data.get("uk")
     files_list = share_data.get("list", [])
 
-    # OPTIMIZATION: Removed time-consuming pre-fetch of existing directory files
     existing_files = {}
 
-    # Transfer requests mutate the same account/session. Serialising them
-    # avoids triggering TeraBox verification when a shared folder is large.
     results = []
     for item in files_list:
         results.append(await _process_single_file_metadata(
@@ -655,13 +571,10 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
             quality
         ))
 
-    # Batch resolve direct download links (dlink) via filemetas
-    # We only query filemetas for successful files (valid fs_id, no error) and when action is not list-only
     if action != "l":
         fs_ids_to_resolve = [r["fs_id"] for r in results if r.get("fs_id") and not r.get("error")]
         
         if fs_ids_to_resolve:
-            # We chunk the fs_ids list in groups of 100 as Terabox filemetas API might have limits
             chunk_size = 100
             fs_id_chunks = [fs_ids_to_resolve[i:i + chunk_size] for i in range(0, len(fs_ids_to_resolve), chunk_size)]
             
@@ -682,9 +595,8 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
                         if entry_fs_id and entry_dlink:
                             dlink_map[entry_fs_id] = entry_dlink
                 except Exception as e:
-                    print(f"[ParallelResolve][ERROR] Batch filemetas request failed: {e}", flush=True)
+                    pass
 
-            # Map the resolved direct links back to results
             for r in results:
                 if r.get("fs_id") and not r.get("error"):
                     my_fs_id = r["fs_id"]
@@ -692,8 +604,6 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
                         r["dlink"] = dlink_map[my_fs_id]
                     elif action == "d":
                         r["error"] = "Failed to resolve direct download link (dlink) from batch filemetas."
-
-            # OPTIMIZATION: Removed the extra API call for VIP locatedownload to save time. 
 
     return {
         "errno": 0,
@@ -705,158 +615,42 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
 
 async def download_file(dlink, filename):
     print("✅ Direct download link retrieved successfully!")
-    print(f"   Link: {dlink[:100]}...")
-
-    # Stream the download
-    print(f"Downloading to local file: {filename} ...")
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=120.0) as dl_client:
             async with dl_client.stream(
-                "GET",
-                dlink,
-                headers={
-                    "User-Agent": UA,
-                    "Referer": BASE_API + "/",
-                },
-                cookies=COOKIES_DICT,
+                "GET", dlink, headers={"User-Agent": UA, "Referer": BASE_API + "/"}, cookies=COOKIES_DICT,
             ) as dr:
                 content_type = dr.headers.get("Content-Type", "")
                 content_length = int(dr.headers.get("Content-Length", 0))
-                print(f"  HTTP Response: {dr.status_code} | Type: {content_type} | Size: {content_length/1024/1024:.2f} MB")
 
                 if dr.status_code not in (200, 206) or content_length < 1000:
-                    print(f"❌ Bad download stream response: {(await dr.aread())[:300].decode('utf-8', errors='ignore')}")
                     return False
 
                 is_zip = "zip" in content_type.lower()
                 temp_filename = filename + ".zip" if is_zip else filename
 
-                # Write chunks to file
                 with open(temp_filename, "wb") as f:
                     downloaded = 0
                     async for chunk in dr.aiter_bytes(1024 * 1024):
                         if chunk:
                             f.write(chunk)
-                            downloaded += len(chunk)
-                            pct = downloaded / content_length * 100 if content_length else 0
-                            bar = "█" * int(pct / 2) + "░" * (50 - int(pct / 2))
-                            print(f"\r  [{bar}] {pct:.1f}%  {downloaded/1024/1024:.1f}/{content_length/1024/1024:.1f} MB", end="", flush=True)
-                    print()
-
                 if is_zip:
-                    print("📦 Extracting ZIP archive...")
                     try:
                         def extract_zip():
                             with zipfile.ZipFile(temp_filename, "r") as zf:
                                 zf.extractall(".")
                             os.remove(temp_filename)
                         await asyncio.to_thread(extract_zip)
-                        print(f"✅ Extraction completed successfully!")
                         return True
                     except Exception as e:
-                        print(f"⚠️ Error extracting ZIP: {e}")
-                        print(f"ZIP file kept at: {temp_filename}")
                         return False
                 else:
-                    print(f"✅ Successfully saved: {filename}")
                     return True
     except Exception as e:
-        print(f"❌ Download failed: {e}")
         return False
 
 async def main():
-    global BDSTOKEN, JSTOKEN
-
-    print("=" * 60)
-    print("        TERABOX AUTOMATIC DIRECT DOWNLOADER & STREAMER")
-    print("=" * 60)
-
-    # Check for --stream or --list in command arguments
-    stream_only = False
-    list_only = False
-    if "--stream" in sys.argv:
-        stream_only = True
-        sys.argv.remove("--stream")
-    if "--list" in sys.argv:
-        list_only = True
-        sys.argv.remove("--list")
-
-    # 1. Get link
-    if len(sys.argv) > 1:
-        link = sys.argv[1]
-    else:
-        link = input("Enter Terabox link (or press Enter for default): ").strip()
-        if not link:
-            link = "https://terasharefile.com/s/11HTXTPgKapRLE3cTXSFMJQ"
-            print(f"Using default link: {link}")
-
-    # 3. Choose Action (Download vs HLS Stream vs List)
-    action = "d"
-    if stream_only:
-        action = "s"
-    elif list_only:
-        action = "l"
-    else:
-        choice = input("\nChoose action: [D]ownload file(s), [S]tream M3U8 playlist(s), or [L]ist files? (D/S/L): ").strip().lower()
-        if choice == "s":
-            action = "s"
-        elif choice == "l":
-            action = "l"
-
-    print("Resolving Terabox link details...")
-    # Call resolve_link with wait_for_transcoding=True since this is a CLI run
-    res = await resolve_link(link, action=action, wait_for_transcoding=True)
-
-    if res.get("errno") != 0:
-        print(f"❌ Error: {res.get('error')}")
-        sys.exit(1)
-
-    print(f"✅ Share Title: {res.get('title')}")
-    print(f"   Share ID   : {res.get('share_id')}")
-    print(f"   Sharer UK  : {res.get('uk')}")
-    print(f"   Files found: {len(res.get('files', []))}")
-
-    if action == "l":
-        print("\n── Shared Files List ──")
-        for i, file in enumerate(res.get("files", []), start=1):
-            filename = file.get("filename")
-            size_mb = file.get("size_mb")
-            fs_id = file.get("original_fs_id")
-            print(f"  {i}. {filename} ({size_mb} MB) - ID: {fs_id}")
-        return
-
-    for file in res.get("files", []):
-        filename = file.get("filename")
-        size_mb = file.get("size_mb")
-        print(f"\nPROCESSING: {filename} ({size_mb} MB)")
-        
-        if file.get("transfer_status") == "skipped_existing":
-            print(f"ℹ️ File already exists in {ROOT_PATH}. Skipping transfer!")
-        
-        if file.get("error") and file.get("error") != "transcoding_in_progress":
-            print(f"❌ Error: {file.get('error')}")
-            continue
-
-        if action == "s":
-            if file.get("stream_ready"):
-                m3u8_filename = os.path.splitext(filename)[0] + ".m3u8"
-                with open(m3u8_filename, "w", encoding="utf-8") as f:
-                    f.write(file.get("stream_m3u8"))
-                print(f"✅ Saved M3U8 streaming playlist to: {m3u8_filename}")
-                print(f"   You can open {m3u8_filename} directly in VLC or PotPlayer to stream the video!")
-            else:
-                choice = input("\nStreaming playlist generation failed (transcoding). Would you like to [D]ownload the raw file instead or [E]xit/Skip? (D/E): ").strip().lower()
-                if choice == "d":
-                    download_res = await resolve_link(link, action="d")
-                    download_file_info = next((f for f in download_res.get("files", []) if f["original_fs_id"] == file["original_fs_id"]), None)
-                    if download_file_info and download_file_info.get("dlink"):
-                        await download_file(download_file_info["dlink"], filename)
-                continue
-
-        elif action == "d":
-            dlink = file.get("dlink")
-            if dlink:
-                await download_file(dlink, filename)
+    pass
 
 if __name__ == "__main__":
     async def run_cli():
