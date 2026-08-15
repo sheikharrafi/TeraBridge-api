@@ -3,6 +3,7 @@ import asyncio
 import re
 import time
 import urllib.parse
+import sys
 
 
 def _height(q):
@@ -20,8 +21,7 @@ def _allowed_host(host):
         '.gibibox.com', '.tibibox.com', '.4funbox.com', '.1024tera.com',
         '.1024nephobox.com', '.terabox.fun', '.terasharefile.com',
         '.teraboxlink.com', '.teraboxshare.com', '.koofr.net', '.koofr.eu',
-        '.baidu.com',
-        'pcs.baidu.com', 'd.pcs.1024terabox.com',
+        '.baidu.com', 'pcs.baidu.com', 'd.pcs.1024terabox.com',
     )
     return any(host == x[1:] or host.endswith(x) for x in allowed if x.startswith('.')) or host in {x for x in allowed if not x.startswith('.')}
 
@@ -94,8 +94,6 @@ def install(g):
         ready.sort(key=lambda x: _height(x[0]), reverse=True)
         q, text, base = ready[0]
 
-        # If the provider answers with a master playlist, follow the first media
-        # playlist so the browser receives one stable media playlist.
         if '#EXT-X-STREAM-INF' in text:
             lines = text.splitlines()
             children = []
@@ -215,3 +213,38 @@ def install(g):
     app.add_api_route('/api/stream/segment', segment, methods=['GET','OPTIONS'])
     app.add_api_route('/api/stream/segment.ts', segment, methods=['GET','OPTIONS'])
     print('[HLS] Installed single-variant media playlist + robust URI rewrite + range proxy.', flush=True)
+
+
+def _auto_patch_fastapi():
+    try:
+        from fastapi import FastAPI
+    except Exception:
+        return
+    original = getattr(FastAPI.add_api_route, '_terabridge_original', FastAPI.add_api_route)
+    if getattr(FastAPI.add_api_route, '_terabridge_hls_hook', False):
+        return
+    installed = set()
+    guard = {'active': False}
+
+    def hooked(self, path, endpoint, *args, **kwargs):
+        if (not guard['active'] and path in {'/api/stream/manifest','/api/stream/playlist.m3u8','/api/stream/segment','/api/stream/segment.ts'} and id(self) not in installed):
+            mod = sys.modules.get('api.index')
+            if mod is not None and hasattr(mod, 'app'):
+                guard['active'] = True
+                try:
+                    FastAPI.add_api_route = original
+                    install(vars(mod))
+                    installed.add(id(self))
+                except Exception as exc:
+                    print(f'[HLS][ERROR] runtime patch install failed: {exc}', flush=True)
+                finally:
+                    FastAPI.add_api_route = hooked
+                    guard['active'] = False
+        return original(self, path, endpoint, *args, **kwargs)
+
+    hooked._terabridge_hls_hook = True
+    hooked._terabridge_original = original
+    FastAPI.add_api_route = hooked
+
+
+_auto_patch_fastapi()
