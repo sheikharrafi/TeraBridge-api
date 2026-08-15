@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TeraBridge Player</title>
+<style>
+:root{color-scheme:dark;--bg:#070b14;--panel:#0d1422;--panel2:#111b2c;--line:#233149;--text:#eef4ff;--muted:#91a0b8;--accent:#6ea8ff;--danger:#ff6b7a;--ok:#5ee6a8}*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;background:radial-gradient(circle at top,#12213a 0,#070b14 48%);color:var(--text);min-height:100vh}.wrap{width:min(1080px,92vw);margin:0 auto;padding:42px 0 60px}.hero{text-align:center;margin-bottom:28px}.badge{display:inline-flex;padding:7px 11px;border:1px solid var(--line);border-radius:999px;background:#0d1627;color:#9fc0ff;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}.hero h1{font-size:clamp(34px,7vw,62px);margin:15px 0 8px;letter-spacing:-.045em}.hero p{color:var(--muted);margin:0}.panel{background:linear-gradient(180deg,#0f1828,#0b111d);border:1px solid var(--line);border-radius:22px;padding:20px;box-shadow:0 20px 60px #0005}.form{display:grid;grid-template-columns:1fr auto;gap:12px}.input{width:100%;border:1px solid var(--line);background:#070d18;color:var(--text);border-radius:13px;padding:15px 16px;outline:none;font-size:15px}.input:focus{border-color:#4d78b9;box-shadow:0 0 0 3px #6ea8ff18}.btn{border:0;border-radius:13px;padding:0 20px;background:var(--accent);color:#07101e;font-weight:800;cursor:pointer;min-height:50px}.btn:disabled{opacity:.55;cursor:wait}.options{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}.small{font-size:12px;color:var(--muted);margin:8px 2px 0}.status{margin-top:16px;padding:12px 14px;border-radius:12px;background:#0a1220;color:var(--muted);display:none}.status.show{display:block}.status.ok{color:var(--ok)}.status.err{color:var(--danger)}.result{margin-top:18px;display:grid;gap:12px}.file{border:1px solid var(--line);background:var(--panel);border-radius:17px;padding:15px;display:grid;grid-template-columns:1fr auto;gap:15px;align-items:center}.name{font-weight:750;word-break:break-word}.meta{font-size:12px;color:var(--muted);margin-top:5px}.actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.action{display:inline-flex;align-items:center;justify-content:center;text-decoration:none;border:1px solid #30415f;background:#101a2b;color:var(--text);border-radius:10px;padding:9px 12px;font-size:13px;font-weight:700;cursor:pointer}.action.primary{background:#dce9ff;color:#08111f;border-color:#dce9ff}.player{margin-top:18px;display:none}.player.show{display:block}.player video{width:100%;max-height:65vh;border-radius:16px;background:#000;border:1px solid var(--line)}.player-title{margin:0 0 10px;font-size:16px}.footer{text-align:center;color:#61708a;font-size:12px;margin-top:22px}.hidden{display:none!important}@media(max-width:700px){.form{grid-template-columns:1fr}.options{grid-template-columns:1fr}.file{grid-template-columns:1fr}.actions{justify-content:flex-start}.btn{width:100%}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="hero"><span class="badge">TeraBridge API</span><h1>Play & download</h1><p>Paste a TeraBox share link and resolve its files.</p></header>
+  <section class="panel">
+    <form id="form" class="form">
+      <input id="link" class="input" type="url" autocomplete="off" placeholder="https://1024terabox.com/s/..." required>
+      <button id="resolve" class="btn" type="submit">Resolve</button>
+    </form>
+    <div class="options">
+      <input id="api" class="input" type="url" autocomplete="off" placeholder="API URL (e.g. https://your-api.vercel.app)">
+      <input id="key" class="input" type="password" autocomplete="off" placeholder="API key (only if your API requires one)">
+    </div>
+    <div class="small">The API URL and key are saved only in this browser. Never put a server secret directly into public frontend source.</div>
+    <div id="status" class="status"></div>
+    <div id="result" class="result"></div>
+    <div id="player" class="player"><h3 id="playerTitle" class="player-title"></h3><video id="video" controls playsinline preload="metadata"></video></div>
+  </section>
+  <div class="footer">Frontend is a static client for the TeraBridge API.</div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const savedApi=localStorage.getItem('tb_api')||location.origin;
+$('api').value=savedApi;
+$('key').value=localStorage.getItem('tb_key')||'';
+function status(msg,type=''){const el=$('status');el.textContent=msg;el.className='status show '+type}
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function headers(){const k=$('key').value.trim();return k?{'X-API-Key':k}:{}}
+function fileSize(n){n=Number(n||0);if(!n)return '';const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return n.toFixed(i?1:0)+' '+u[i]}
+function resetPlayer(){ $('video').pause();$('video').removeAttribute('src');$('video').load();$('player').classList.remove('show') }
+function render(data){
+  const box=$('result');box.innerHTML='';resetPlayer();
+  const files=Array.isArray(data.files)?data.files:[];
+  if(!files.length){status('No files were returned.','err');return}
+  status(`${files.length} file${files.length===1?'':'s'} resolved.`,'ok');
+  files.forEach((f,i)=>{
+    const row=document.createElement('div');row.className='file';
+    const isVideo=!!f.stream_url || /\.(mp4|mkv|webm|avi|mov|m4v|flv|wmv|3gp|mpg|mpeg|ts)$/i.test(f.filename||'');
+    row.innerHTML=`<div><div class="name">${esc(f.filename||'Untitled')}</div><div class="meta">${fileSize(f.size_bytes)}${f.error?' · '+esc(f.error):''}</div></div><div class="actions"></div>`;
+    const actions=row.querySelector('.actions');
+    if(f.dlink){const a=document.createElement('a');a.className='action primary';a.href=f.dlink;a.textContent='Download';a.target='_blank';a.rel='noopener';actions.appendChild(a)}
+    if(isVideo && f.stream_url){const b=document.createElement('button');b.className='action';b.textContent='Play';b.onclick=()=>play(f);actions.appendChild(b)}
+    if(!actions.children.length){const s=document.createElement('span');s.className='meta';s.textContent='No usable action';actions.appendChild(s)}
+    box.appendChild(row)
+  })
+}
+function play(f){$('playerTitle').textContent=f.filename||'Video';const v=$('video');v.src=f.stream_url;v.load();$('player').classList.add('show');$('player').scrollIntoView({behavior:'smooth',block:'nearest'})}
+$('form').addEventListener('submit',async e=>{
+ e.preventDefault();const link=$('link').value.trim(),api=$('api').value.trim().replace(/\/$/,'');const key=$('key').value.trim();
+ if(!api){status('Enter the API URL.','err');return}
+ localStorage.setItem('tb_api',api);localStorage.setItem('tb_key',key);
+ $('resolve').disabled=true;$('result').innerHTML='';resetPlayer();status('Resolving…');
+ try{
+   const u=api+'/api/resolve?url='+encodeURIComponent(link)+'&mode=list';
+   const r=await fetch(u,{headers:headers()});let data={};try{data=await r.json()}catch{}
+   if(!r.ok)throw new Error(data.message||`HTTP ${r.status}`);render(data);
+ }catch(err){status(err.message||'Request failed.','err')}
+ finally{$('resolve').disabled=false}
+});
+</script>
+</body>
+</html>
