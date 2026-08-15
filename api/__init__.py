@@ -12,6 +12,13 @@ import os
 import time
 import urllib.parse
 
+# HLS segment playback must stay on the API proxy.  A 307 redirect to the
+# TeraBox CDN makes the browser follow the redirect cross-origin and can fail
+# CORS/range playback; it also defeats the segment proxy's header handling.
+# Set this before api.index.py is imported, because index.py reads the env var
+# at module-import time.
+os.environ["REDIRECT_SEGMENTS"] = "false"
+
 
 def _install_recursive_share_resolver():
     import downloader
