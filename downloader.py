@@ -750,6 +750,7 @@ async def _resolve_link(link, action="d", wait_for_transcoding=False, quality=No
                     for entry in entries:
                         entry_fs_id = str(entry.get("fs_id", ""))
                         entry_dlink = entry.get("dlink", "")
+                        print("[RAW-DLINK]", entry_dlink, flush=True)
                         if entry_fs_id and entry_dlink:
                             dlink_map[entry_fs_id] = entry_dlink
                 except Exception as e:
